@@ -1,0 +1,36 @@
+name = "Modbus Control"
+version = "0.1.0"
+description = "Read and write named and raw Modbus registers through the Zelos Modbus agent extension."
+author = "Zelos"
+repository = "https://github.com/zeloscloud/zelos-app-modbus"
+icon = "assets/icon.png"
+readme = "README.md"
+
+# Compatibility — pinned to the host that ships the extensions.start/stop
+# server side (in addition to the actions.* / extensions.list bridge
+# surface that's been around since 26.0.3). The `-0` suffix tells the
+# semver resolver to also accept 26.0.5 pre-releases (alpha/beta), since
+# 26.0.5-alpha.0 is the first cut that ships the lifecycle dispatchers.
+[zelos]
+version = ">=26.0.5-0"
+
+[host]
+type = "app"
+
+[host.app]
+kind = "web_app"
+entry = "dist/index.html"
+
+[package]
+paths = ["dist"]
+
+# This app drives the Modbus agent extension exclusively. The host should
+# surface a clear "missing dependency" state at install time if the required
+# extension is not present, instead of leaving the user with a useless
+# "extension missing" banner. 0.1.5 is the first extension release carrying
+# list_interfaces / get_snapshot / list_registers(enriched); the app's
+# capability resolver also gates on those actions actually being registered,
+# which is the real runtime guard.
+[[requires]]
+extension = "zeloscloud.zelos-extension-modbus"
+version = ">=0.1.5-0"
