@@ -18,19 +18,13 @@ import type { ModbusSnapshot } from "@/lib/types";
 const SNAPSHOT_POLL_MS = 1_000;
 
 export function useSnapshot(
-  bridge: BridgeTransport | null,
-  agent: string | null,
-  iface: string | null,
+  bridge: BridgeTransport,
+  agent: string,
+  iface: string,
 ): UseQueryResult<ModbusSnapshot> {
   return useQuery<ModbusSnapshot>({
     queryKey: ["modbus-snapshot", agent, iface],
-    queryFn: async () => {
-      if (!bridge || !agent || !iface) {
-        throw new Error("useSnapshot: bridge/agent/interface missing");
-      }
-      return await getSnapshot(bridge, agent, iface);
-    },
-    enabled: bridge !== null && agent !== null && iface !== null,
+    queryFn: async () => getSnapshot(bridge, agent, iface),
     staleTime: SNAPSHOT_POLL_MS,
     refetchInterval: SNAPSHOT_POLL_MS,
     refetchOnWindowFocus: true,

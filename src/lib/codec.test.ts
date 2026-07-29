@@ -17,9 +17,14 @@ import {
   formatAddress,
   formatDecodedValue,
   formatWordsHex,
+  isBitTable,
   isByteOrder,
   isModbusDatatype,
+  isRegisterTableType,
+  isRepresentable,
+  isWritableTable,
   parseAddress,
+  parseWriteDraft,
   physicalRange,
   rawRange,
   readWordCount,
@@ -27,7 +32,13 @@ import {
   validateWriteValue,
   wordCount,
 } from "./codec";
-import { BYTE_ORDERS, MODBUS_DATATYPES, type ByteOrder, type ModbusDatatype } from "./types";
+import {
+  BYTE_ORDERS,
+  MODBUS_DATATYPES,
+  REGISTER_TYPES,
+  type ByteOrder,
+  type ModbusDatatype,
+} from "./types";
 
 // ─── Ported from TestValueCodec ─────────────────────────────────────────────
 
@@ -441,6 +452,128 @@ describe("parseAddress", () => {
       expect(parseAddress(input)).toBeNull();
     },
   );
+});
+
+describe("table predicates", () => {
+  it("knows which tables carry bits", () => {
+    expect(isBitTable("coil")).toBe(true);
+    expect(isBitTable("discrete_input")).toBe(true);
+    expect(isBitTable("holding")).toBe(false);
+    expect(isBitTable("input")).toBe(false);
+  });
+
+  it("knows which tables Modbus can write", () => {
+    expect(isWritableTable("holding")).toBe(true);
+    expect(isWritableTable("coil")).toBe(true);
+    // Read-only by protocol, whatever a register map claims.
+    expect(isWritableTable("input")).toBe(false);
+    expect(isWritableTable("discrete_input")).toBe(false);
+  });
+
+  it("recognizes exactly the four table names", () => {
+    for (const table of REGISTER_TYPES) expect(isRegisterTableType(table)).toBe(true);
+    for (const nonsense of ["", "holdings", "Coil", 3, null, undefined]) {
+      expect(isRegisterTableType(nonsense)).toBe(false);
+    }
+  });
+});
+
+describe("parseWriteDraft", () => {
+  it("says nothing about an empty draft — not valid, not an error", () => {
+    for (const draft of ["", "   "]) {
+      expect(parseWriteDraft(draft, "uint16", 1)).toEqual({ value: null, error: null });
+    }
+  });
+
+  it("takes a number, trimming what the user typed around it", () => {
+    expect(parseWriteDraft(" 1234 ", "uint16", 1)).toEqual({ value: 1234, error: null });
+    expect(parseWriteDraft("-12.5", "int16", 0.1)).toEqual({ value: -12.5, error: null });
+  });
+
+  it("names a draft that isn't a number at all", () => {
+    expect(parseWriteDraft("abc", "uint16", 1)).toEqual({ value: null, error: "not a number" });
+  });
+
+  it("refuses a number the codec would refuse, with the codec's own words", () => {
+    const { value, error } = parseWriteDraft("70000", "uint16", 1);
+    expect(value).toBeNull();
+    expect(error).toMatch(/out of range/);
+    // Same verdict, same message as the encoder itself would give.
+    expect(error).toBe(validateWriteValue(70000, "uint16", 1).ok === false ? error : null);
+  });
+
+  it("validates against the scale, not the raw range", () => {
+    // int16 × 0.1 tops out at 3276.7 physical.
+    expect(parseWriteDraft("3000", "int16", 0.1).error).toBeNull();
+    expect(parseWriteDraft("5000", "int16", 0.1).error).toMatch(/out of range/);
+  });
+
+  it("refuses a fraction an integer register would silently truncate", () => {
+    const { value, error } = parseWriteDraft("1.9", "uint16", 1);
+    expect(value).toBeNull();
+    // Naming the value that WOULD be written is the point: 1.9 becomes 1.
+    expect(error).toBe("1.9 is not a whole uint16 step — nearest writable value is 1");
+    expect(parseWriteDraft("-2.5", "int16", 1).error).toMatch(/nearest writable value is -2/);
+  });
+
+  it("keeps a fraction the scale makes whole", () => {
+    // 100.5 at ×0.1 is raw 1005 — a real step, even though the division is
+    // inexact in binary (1004.9999999999999).
+    expect(parseWriteDraft("100.5", "int16", 0.1)).toEqual({ value: 100.5, error: null });
+    expect(parseWriteDraft("23.4", "int16", 0.1).error).toBeNull();
+    // …and still refuses one it doesn't.
+    expect(parseWriteDraft("100.55", "int16", 0.1).error).toMatch(/not a whole int16 step/);
+  });
+
+  it("leaves float registers alone — every value is a step there", () => {
+    expect(parseWriteDraft("1.9", "float32", 1).error).toBeNull();
+    expect(parseWriteDraft("0.30000000001", "float64", 1).error).toBeNull();
+  });
+
+  it("carries a 64-bit integer as a BigInt, past what a double can hold", () => {
+    const big = parseWriteDraft("18446744073709551615", "uint64", 1);
+    expect(big).toEqual({ value: 18446744073709551615n, error: null });
+    // The nearest double would be 18446744073709551616 — a different number.
+    expect(big.value).not.toBe(Number("18446744073709551615"));
+    expect(parseWriteDraft("-9223372036854775808", "int64", 1).value).toBe(-9223372036854775808n);
+  });
+
+  it("refuses a 64-bit value a named write can't carry, and allows it raw", () => {
+    const overJson = parseWriteDraft("9007199254740993", "uint64", 1, "json");
+    expect(overJson.value).toBeNull();
+    expect(overJson.error).toMatch(/9007199254740991/);
+    // The same draft is fine where the words are built client-side.
+    expect(parseWriteDraft("9007199254740993", "uint64", 1, "words").value).toBe(9007199254740993n);
+    // Below the limit a named write is exact, so it passes either way.
+    expect(parseWriteDraft("42", "uint64", 1, "json").value).toBe(42n);
+  });
+
+  it("still range-checks a 64-bit draft, and still refuses a fractional one", () => {
+    expect(parseWriteDraft("18446744073709551616", "uint64", 1).error).toMatch(/out of range/);
+    expect(parseWriteDraft("-1", "uint64", 1).error).toMatch(/out of range/);
+    expect(parseWriteDraft("1.5", "int64", 1).error).toMatch(/not a whole int64 step/);
+    expect(parseWriteDraft("abc", "int64", 1).error).toBe("not a number");
+  });
+});
+
+describe("isRepresentable", () => {
+  it("accepts anything the UI can print", () => {
+    for (const value of [0, -1, 3.14, true, false, 18446744073709551615n]) {
+      expect(isRepresentable(value)).toBe(true);
+    }
+  });
+
+  it("rejects the extension's stand-in for a non-finite value", () => {
+    expect(isRepresentable(null)).toBe(false);
+  });
+
+  it("rejects a non-finite number a client-side decode produced", () => {
+    expect(isRepresentable(Number.NaN)).toBe(false);
+    expect(isRepresentable(Number.POSITIVE_INFINITY)).toBe(false);
+    expect(isRepresentable(Number.NEGATIVE_INFINITY)).toBe(false);
+    // The float32 an unpopulated sensor reports.
+    expect(isRepresentable(decodeValue([0xffff, 0xffff], "float32"))).toBe(false);
+  });
 });
 
 describe("formatters", () => {

@@ -8,11 +8,17 @@
  *  - modbus/list_interfaces: every 5s per agent that has the extension running.
  *    Interface churn only happens on an extension restart, so anything faster
  *    is wasted round-trips.
+ *
+ *  Identity matters here: everything below this hook memoizes on what it returns,
+ *  so the per-agent interface map is folded inside `useQueries` through `combine`
+ *  — which only reruns when a result changes — rather than in a `useMemo` over
+ *  the results array, which is a fresh array every render and so memoizes
+ *  nothing.
  */
 
 import { actions, extensions, type BridgeTransport } from "@zeloscloud/app-extension-sdk";
-import { useQueries, useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo } from "react";
 
 import { listInterfaces } from "@/lib/modbus-bridge";
 import { discoverModbus, type ModbusDiscovery } from "@/lib/capability";
@@ -21,11 +27,12 @@ import {
   type ModbusInterfaceEntry,
   type WorkspaceModeKind,
 } from "@/lib/types";
+import { errorMessage } from "@/lib/utils";
 
 const DISCOVERY_POLL_MS = 5_000;
 
 export interface UseModbusDiscoveryInput {
-  bridge: BridgeTransport | null;
+  bridge: BridgeTransport;
   workspaceModeKind: WorkspaceModeKind;
 }
 
@@ -34,11 +41,12 @@ export function useModbusDiscovery(input: UseModbusDiscoveryInput): {
   isLoading: boolean;
   refetch: () => void;
 } {
-  const enabled = input.bridge !== null && input.workspaceModeKind === "LIVE";
+  const { bridge, workspaceModeKind } = input;
+  const enabled = workspaceModeKind === "LIVE";
 
   const extensionsQuery = useQuery({
     queryKey: ["modbus-extensions-list"],
-    queryFn: async () => extensions.list(input.bridge!),
+    queryFn: async () => extensions.list(bridge),
     enabled,
     staleTime: 2000,
     refetchInterval: enabled ? DISCOVERY_POLL_MS : false,
@@ -46,7 +54,7 @@ export function useModbusDiscovery(input: UseModbusDiscoveryInput): {
 
   const actionsQuery = useQuery({
     queryKey: ["modbus-actions-list"],
-    queryFn: async () => actions.list(input.bridge!),
+    queryFn: async () => actions.list(bridge),
     enabled,
     staleTime: 2000,
     refetchInterval: enabled ? DISCOVERY_POLL_MS : false,
@@ -67,45 +75,66 @@ export function useModbusDiscovery(input: UseModbusDiscoveryInput): {
     return result.sort();
   }, [extensionsQuery.data]);
 
-  const interfaceQueries = useQueries({
+  const interfaces = useQueries({
     queries: interfaceAgents.map((agent) => ({
       queryKey: ["modbus-list-interfaces", agent],
-      queryFn: async () => listInterfaces(input.bridge!, agent),
+      queryFn: async () => listInterfaces(bridge, agent),
       enabled,
       staleTime: 2000,
       refetchInterval: enabled ? DISCOVERY_POLL_MS : false,
     })),
+    combine: (results) => ({
+      byAgent: Object.fromEntries(
+        interfaceAgents.map((agent, i) => [agent, results[i]?.data?.interfaces]),
+      ) as Record<string, ModbusInterfaceEntry[] | undefined>,
+      // A failure has to reach the resolver, or a permanently failing agent sits
+      // on "Discovering interfaces…" forever.
+      errorsByAgent: Object.fromEntries(
+        interfaceAgents.map((agent, i) => {
+          const error = results[i]?.error;
+          return [agent, error ? errorMessage(error) : undefined];
+        }),
+      ) as Record<string, string | undefined>,
+      isLoading: results.some((r) => r.isLoading),
+      refetch: () => results.forEach((r) => void r.refetch()),
+    }),
   });
-
-  const interfacesByAgent = useMemo<Record<string, ModbusInterfaceEntry[] | undefined>>(() => {
-    const out: Record<string, ModbusInterfaceEntry[] | undefined> = {};
-    interfaceAgents.forEach((agent, i) => {
-      out[agent] = interfaceQueries[i]?.data?.interfaces;
-    });
-    return out;
-  }, [interfaceAgents, interfaceQueries]);
 
   const discovery = useMemo(
     () =>
       discoverModbus({
-        workspaceModeKind: input.workspaceModeKind,
+        workspaceModeKind,
         extensionsByAgent: extensionsQuery.data ?? null,
         actionsByAgent: actionsQuery.data ?? null,
-        interfacesByAgent,
+        interfacesByAgent: interfaces.byAgent,
+        interfaceErrorsByAgent: interfaces.errorsByAgent,
       }),
-    [input.workspaceModeKind, extensionsQuery.data, actionsQuery.data, interfacesByAgent],
+    [
+      workspaceModeKind,
+      extensionsQuery.data,
+      actionsQuery.data,
+      interfaces.byAgent,
+      interfaces.errorsByAgent,
+    ],
   );
+
+  const queryClient = useQueryClient();
+  const refetchExtensions = extensionsQuery.refetch;
+  const refetchActions = actionsQuery.refetch;
+  const refetchInterfaces = interfaces.refetch;
+  const refetch = useCallback(() => {
+    void refetchExtensions();
+    void refetchActions();
+    refetchInterfaces();
+    // The register catalogs are cached forever on purpose (a map is immutable
+    // for the life of an extension process), so Refresh is the only thing that
+    // can retire one after a restart — or retry one that failed.
+    void queryClient.invalidateQueries({ queryKey: ["modbus-registers"] });
+  }, [refetchExtensions, refetchActions, refetchInterfaces, queryClient]);
 
   return {
     discovery,
-    isLoading:
-      extensionsQuery.isLoading ||
-      actionsQuery.isLoading ||
-      interfaceQueries.some((q) => q.isLoading),
-    refetch: () => {
-      void extensionsQuery.refetch();
-      void actionsQuery.refetch();
-      interfaceQueries.forEach((q) => void q.refetch());
-    },
+    isLoading: extensionsQuery.isLoading || actionsQuery.isLoading || interfaces.isLoading,
+    refetch,
   };
 }

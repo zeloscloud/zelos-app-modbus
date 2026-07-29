@@ -8,6 +8,8 @@
  *  signatures + return dicts use snake_case; the app's TS interfaces mirror
  *  that so the JSON round-trips without translation. */
 
+import type { AppBridgeWorkspaceInfo } from "@zeloscloud/app-extension-sdk";
+
 /** Marketplace-canonical Modbus agent extension ID. The app's manifest
  *  `requires` block pins to this same value. */
 export const MODBUS_EXTENSION_ID = "zeloscloud.zelos-extension-modbus";
@@ -66,9 +68,12 @@ export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = [
  *  remediation copy only — the action-path check above is the real guard. */
 export const MIN_MODBUS_EXTENSION_VERSION = "0.1.5";
 
+/** Namespace every Modbus action path sits under. */
+export const MODBUS_ACTION_PREFIX = "modbus/";
+
 /** Build the full action path for a given method. */
 export function modbusActionPath(method: ModbusMethodName | string): string {
-  return `modbus/${method}`;
+  return `${MODBUS_ACTION_PREFIX}${method}`;
 }
 
 // ─── Protocol enums (wire = snake_case strings) ─────────────────────────────
@@ -102,10 +107,12 @@ export type ByteOrder = (typeof BYTE_ORDERS)[number];
 
 export type ModbusTransport = "tcp" | "rtu";
 
-/** Workspace mode as reported by the host bridge. Open union mirroring the
- *  SDK's forward-compat shape (0.2.0 widened `workspace.modeKind`) — any
- *  unrecognized future mode is simply not "LIVE" and disables actions. */
-export type WorkspaceModeKind = "NONE" | "LIVE" | "TRACEPATH" | "TRACE" | (string & {});
+/** Workspace mode as reported by the host bridge — taken straight from the SDK
+ *  rather than restated here, because it is the SDK's bridge shape and not a
+ *  frozen Python wire shape like everything else in this file. It stays an open
+ *  union (0.2.0 widened `workspace.modeKind`), so any unrecognized future mode is
+ *  simply not "LIVE" and disables actions. */
+export type WorkspaceModeKind = AppBridgeWorkspaceInfo["modeKind"];
 
 // ─── modbus/list_interfaces ─────────────────────────────────────────────────
 
@@ -136,7 +143,12 @@ export interface ListInterfacesResult {
 // ─── modbus/get_snapshot ────────────────────────────────────────────────────
 
 export interface SnapshotValue {
-  value: number | boolean;
+  /** `null` when the polled value isn't representable in JSON: the extension
+   *  sanitizes non-finite floats (a NaN or ±Inf straight off the wire — e.g. a
+   *  float32 of all ones from an unpopulated sensor) to null at the action
+   *  boundary rather than failing the whole snapshot. The poll succeeded; only
+   *  the number is unusable. */
+  value: number | boolean | null;
   /** Unix epoch ms, agent clock, of the poll that produced this value. */
   ts_ms: number;
 }
@@ -191,6 +203,9 @@ export interface NamedRegisterResult {
   address: number;
   type: RegisterTableType;
   datatype: ModbusDatatype;
+  /** `null` alongside `success: true` is a successful read of a value JSON can't
+   *  carry — a sanitized non-finite float, exactly as in {@link SnapshotValue}.
+   *  It is not a failure, and not the same thing as "never read". */
   value: number | boolean | null;
   unit: string;
   success: boolean;

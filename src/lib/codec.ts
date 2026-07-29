@@ -23,9 +23,11 @@
  *  implementation site:
  *
  *  1. 64-bit integers are assembled/packed through `BigInt`, and an unscaled
- *     decode returns that `BigInt` exactly. Python routes every integer decode
- *     through `int(value * scale)` — a float multiply even at `scale = 1.0` —
- *     so it silently loses precision above 2^53. Values below 2^53 agree.
+ *     decode returns that `BigInt` exactly. Python short-circuits `scale == 1`
+ *     for integers too (`_scaled_int`), so both sides are exact at scale 1; the
+ *     difference is that TS additionally keeps the `bigint` all the way through
+ *     the UI, so a value above 2^53 can be displayed and re-written without
+ *     passing through a double. Scaled decodes agree.
  *  2. Out-of-range encodes throw instead of wrapping. Python's `uint16` branch
  *     masks with `& 0xFFFF` (70000 → 4464) and the others raise `struct.error`;
  *     refusing the write is the safer behavior for a UI and matches what the
@@ -35,10 +37,12 @@ import {
   BIT_REGISTER_TYPES,
   MODBUS_DATATYPES,
   BYTE_ORDERS,
+  REGISTER_TYPES,
   type ByteOrder,
   type ModbusDatatype,
   type RegisterTableType,
 } from "./types";
+import { errorMessage } from "./utils";
 
 /** A value decoded off the wire. `bigint` only for unscaled 64-bit integers. */
 export type DecodedValue = number | boolean | bigint;
@@ -59,9 +63,10 @@ export const WORD_COUNTS: Readonly<Record<ModbusDatatype, number>> = {
 /** Largest `count` the extension's `read_register` action accepts.
  *
  *  The Modbus protocol allows 125 words but 2000 bits per request; the
- *  extension's action schema declares `maximum=125` for every table, so the
- *  app clamps to the tighter of the two rather than issuing a request the
- *  extension may reject. */
+ *  extension's action schema declares `maximum=125` for every table, so this is
+ *  the tighter of the two. Nothing in the app can exceed it — a row reads one
+ *  value, so at most four words — but it is what the mock host validates
+ *  against, and what any future multi-value read has to respect. */
 export const MAX_READ_COUNT = 125;
 
 const FLOAT32_MAX = 3.4028234663852886e38;
@@ -70,17 +75,36 @@ export function wordCount(datatype: ModbusDatatype): number {
   return WORD_COUNTS[datatype];
 }
 
-export function isModbusDatatype(value: string): value is ModbusDatatype {
-  return (MODBUS_DATATYPES as readonly string[]).includes(value);
+/** The three wire-enum guards take `unknown`: they screen both a `<select>`
+ *  value and a field off unvalidated localStorage. */
+export function isModbusDatatype(value: unknown): value is ModbusDatatype {
+  return typeof value === "string" && (MODBUS_DATATYPES as readonly string[]).includes(value);
 }
 
-export function isByteOrder(value: string): value is ByteOrder {
-  return (BYTE_ORDERS as readonly string[]).includes(value);
+export function isByteOrder(value: unknown): value is ByteOrder {
+  return typeof value === "string" && (BYTE_ORDERS as readonly string[]).includes(value);
+}
+
+export function isRegisterTableType(value: unknown): value is RegisterTableType {
+  return typeof value === "string" && (REGISTER_TYPES as readonly string[]).includes(value);
 }
 
 /** Bit tables carry booleans, one per address — no word decode, no datatype. */
 export function isBitTable(table: RegisterTableType): boolean {
   return BIT_REGISTER_TYPES.has(table);
+}
+
+/** Modbus only writes two of the four tables: holding registers (FC6/FC16) and
+ *  coils (FC5). Input registers and discrete inputs are read-only by protocol,
+ *  whatever the device claims. */
+export function isWritableTable(table: RegisterTableType): boolean {
+  return table === "holding" || table === "coil";
+}
+
+/** Does this register carry a single bit? Either the table says so, or a word
+ *  register was mapped as `bool`. The write editor turns into a switch for both. */
+export function isBooleanRegister(table: RegisterTableType, datatype: ModbusDatatype): boolean {
+  return isBitTable(table) || datatype === "bool";
 }
 
 /** Word-granular reorder, exactly as `_reorder_registers` does it.
@@ -266,8 +290,86 @@ export function validateWriteValue(
     encodeValue(value, datatype, scale);
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    return { ok: false, error: errorMessage(e) };
   }
+}
+
+/** Integer datatypes hold whole raw counts and nothing else. */
+const INTEGER_DATATYPES: ReadonlySet<ModbusDatatype> = new Set<ModbusDatatype>([
+  "bool",
+  "uint16",
+  "int16",
+  "uint32",
+  "int32",
+  "uint64",
+  "int64",
+]);
+
+const SIXTY_FOUR_BIT: ReadonlySet<ModbusDatatype> = new Set<ModbusDatatype>(["uint64", "int64"]);
+
+/** How far off a whole raw count a scaled draft may land before we call it
+ *  fractional. Dividing by a decimal scale is inexact in binary floating point —
+ *  `100.5 / 0.1` is `1004.9999999999999` — so the test has to be a tolerance, not
+ *  an equality. */
+const STEP_TOLERANCE = 1e-9;
+
+/** Largest integer JSON can carry without losing a digit. */
+const MAX_EXACT_JSON_INT = BigInt(Number.MAX_SAFE_INTEGER);
+
+/** How a write reaches the device, which decides what it can carry.
+ *
+ *  - `json`: a named write hands the extension a JSON number and lets it encode.
+ *    Above 2^53 that number is already wrong by the time the agent sees it.
+ *  - `words`: a raw write is encoded to 16-bit words here, so a `bigint`
+ *    round-trips exactly and the datatype's full range is expressible. */
+export type WriteWire = "json" | "words";
+
+/** One pass over what the user typed into a write editor: the value to send, or
+ *  the reason it can't be sent. Both come from here, so the inline error and the
+ *  refusal to write can't disagree — and neither can the codec, which is what
+ *  {@link validateWriteValue} asks. An empty draft is neither valid nor an error. */
+export function parseWriteDraft(
+  draft: string,
+  datatype: ModbusDatatype,
+  scale: number,
+  wire: WriteWire = "words",
+): { value: number | bigint | null; error: string | null } {
+  const trimmed = draft.trim();
+  if (trimmed.length === 0) return { value: null, error: null };
+
+  // A 64-bit integer only survives as a BigInt, and only when nothing scales it.
+  if (SIXTY_FOUR_BIT.has(datatype) && scale === 1 && /^[+-]?\d+$/.test(trimmed)) {
+    const big = BigInt(trimmed);
+    if (wire === "json" && (big > MAX_EXACT_JSON_INT || big < -MAX_EXACT_JSON_INT)) {
+      return {
+        value: null,
+        error: `a named write goes over JSON, which can't carry more than ${MAX_EXACT_JSON_INT} exactly — use a raw row for this`,
+      };
+    }
+    const verdict = validateWriteValue(big, datatype, scale);
+    return verdict.ok ? { value: big, error: null } : { value: null, error: verdict.error };
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return { value: null, error: "not a number" };
+  const step = stepError(parsed, datatype, scale);
+  if (step !== null) return { value: null, error: step };
+  const verdict = validateWriteValue(parsed, datatype, scale);
+  if (!verdict.ok) return { value: null, error: verdict.error };
+  return { value: parsed, error: null };
+}
+
+/** Refuse a draft the encoder would quietly truncate, and say what it would have
+ *  written instead. A draft the scale makes whole (`100.5` at `×0.1` is raw 1005)
+ *  is not fractional and passes. */
+function stepError(value: number, datatype: ModbusDatatype, scale: number): string | null {
+  if (!INTEGER_DATATYPES.has(datatype)) return null;
+  const divisor = scale !== 0 && Number.isFinite(scale) ? scale : 1;
+  const raw = value / divisor;
+  const nearest = Math.round(raw);
+  if (Math.abs(raw - nearest) <= STEP_TOLERANCE * Math.max(1, Math.abs(raw))) return null;
+  const writable = truncToward0(raw) * divisor;
+  return `${formatDecodedValue(value)} is not a whole ${datatype} step — nearest writable value is ${formatDecodedValue(writable)}`;
 }
 
 // ─── Formatting / parsing helpers ───────────────────────────────────────────
@@ -299,6 +401,16 @@ export function parseAddress(input: string): number | null {
   }
   if (!Number.isInteger(value) || value < 0 || value > 65535) return null;
   return value;
+}
+
+/** Can this value be printed, and offered back as a write default?
+ *
+ *  Two things fail that test and mean the same thing to a user: `null`, which is
+ *  what the extension sends when a value isn't JSON-representable, and a
+ *  non-finite number, which is what a client-side decode of the same words
+ *  produces. Neither is a missing sample — the read happened. */
+export function isRepresentable(value: DecodedValue | null): value is DecodedValue {
+  return value !== null && (typeof value !== "number" || Number.isFinite(value));
 }
 
 /** Display form for a decoded value. Booleans read as ON/OFF (the wire idiom

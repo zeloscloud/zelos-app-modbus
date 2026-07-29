@@ -4,6 +4,7 @@
  *  in the agent cards. This banner covers the two cases that aren't
  *  agent-specific: workspace not LIVE, and zero agents connected at all. */
 
+import { Button } from "@/components/ui/button";
 import type { TopLevelDisabledReason } from "@/lib/capability";
 
 const DISABLED_COPY: Record<TopLevelDisabledReason, string> = {
@@ -28,14 +29,10 @@ export function CapabilityBanner({ reason, onRefresh }: CapabilityBannerProps) {
         Modbus control unavailable
       </h2>
       <p className="text-sm">{DISABLED_COPY[reason]}</p>
-      <div className="flex gap-2 text-xs">
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="rounded border border-border px-3 py-1.5 hover:bg-background"
-        >
+      <div className="flex items-center gap-2 text-xs">
+        <Button size="sm" variant="outline" onClick={onRefresh}>
           Refresh
-        </button>
+        </Button>
         <span className="text-muted-foreground">
           reason: <code>{reason}</code>
         </span>

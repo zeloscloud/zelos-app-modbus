@@ -3,13 +3,7 @@
 import type { ExtensionEntry } from "@zeloscloud/app-extension-sdk";
 import { describe, expect, it } from "vitest";
 
-import {
-  discoverModbus,
-  remediation,
-  resolveAgentStatus,
-  statusLabel,
-  type DiscoverInputs,
-} from "./capability";
+import { discoverModbus, remediation, resolveAgentStatus, type DiscoverInputs } from "./capability";
 import {
   MODBUS_EXTENSION_ID,
   REQUIRED_MODBUS_METHODS,
@@ -108,10 +102,29 @@ describe("resolveAgentStatus", () => {
   });
 
   it("returns extension-missing when no Modbus extension is installed", () => {
-    expect(resolveAgentStatus("a:1", [], [], undefined)).toEqual({
+    // Something answered for this agent — just nothing of ours.
+    expect(resolveAgentStatus("a:1", [], ["can-tx/send"], undefined)).toEqual({
       agent: "a:1",
       kind: "extension-missing",
     });
+  });
+
+  it("returns nothing-registered when the agent answered with nothing at all", () => {
+    // The host inserts empty results for an agent it can't reach; telling the
+    // user to install an extension there would be a guess.
+    expect(resolveAgentStatus("a:1", [], [], undefined)).toEqual({
+      agent: "a:1",
+      kind: "nothing-registered",
+    });
+    expect(remediation({ agent: "a:1", kind: "nothing-registered" })).toMatch(/may be unreachable/);
+  });
+
+  it("returns extension-starting while a running extension has registered nothing", () => {
+    // Every Start passes through this. It is not an old extension.
+    const status = resolveAgentStatus("a:1", [runningExt], ["can-tx/send"], undefined);
+    expect(status).toMatchObject({ kind: "extension-starting", extension: runningExt });
+    expect(status.missingMethods).toBeUndefined();
+    expect(remediation(status)).toBeNull();
   });
 
   it("returns extension-stopped when the extension exists but is not running", () => {
@@ -140,9 +153,30 @@ describe("resolveAgentStatus", () => {
   });
 
   it("prefers extension-outdated over the interface list (a stale action set is the real problem)", () => {
-    const status = resolveAgentStatus("a:1", [runningExt], [], [meter]);
+    // One Modbus path registered, so the extension is up and simply too old.
+    const status = resolveAgentStatus(
+      "a:1",
+      [runningExt],
+      [modbusActionPath("read_register")],
+      [meter],
+    );
     expect(status.kind).toBe("extension-outdated");
-    expect(status.missingMethods).toEqual([...REQUIRED_MODBUS_METHODS]);
+    expect(status.missingMethods).toEqual(
+      REQUIRED_MODBUS_METHODS.filter((m) => m !== "read_register"),
+    );
+  });
+
+  it("returns discovery-failed when list_interfaces itself failed", () => {
+    const status = resolveAgentStatus(
+      "a:1",
+      [runningExt],
+      allRequiredActionPaths(),
+      undefined,
+      "connection refused",
+    );
+    expect(status).toMatchObject({ kind: "discovery-failed", error: "connection refused" });
+    // Not "still loading": a persistent failure has to stop looking in-flight.
+    expect(remediation(status)).toMatch(/connection refused/);
   });
 
   it("returns discovering-interfaces while list_interfaces is in flight", () => {
@@ -183,7 +217,10 @@ describe("discoverModbus", () => {
     const disc = discoverModbus(
       baseDiscoveryInput({
         extensionsByAgent: { "localhost:2300": [runningExt], "remote:2300": [] },
-        actionsByAgent: { "localhost:2300": allRequiredActionPaths(), "remote:2300": [] },
+        actionsByAgent: {
+          "localhost:2300": allRequiredActionPaths(),
+          "remote:2300": ["can-tx/send"],
+        },
         interfacesByAgent: { "localhost:2300": [meter] },
       }),
     );
@@ -244,34 +281,7 @@ describe("discoverModbus", () => {
   });
 });
 
-// ─── Labels + remediation ───────────────────────────────────────────────────
-
-describe("statusLabel", () => {
-  it("renders interface counts for ready agents", () => {
-    expect(statusLabel({ agent: "a", kind: "ready", interfaces: [meter] })).toBe(
-      "ready (1 interface)",
-    );
-    expect(statusLabel({ agent: "a", kind: "ready", interfaces: [meter, probe] })).toBe(
-      "ready (2 interfaces)",
-    );
-  });
-
-  it("renders each failure kind", () => {
-    expect(statusLabel({ agent: "a", kind: "extension-missing" })).toBe(
-      "Modbus extension not installed",
-    );
-    expect(statusLabel({ agent: "a", kind: "extension-stopped", extension: stoppedExt })).toBe(
-      "Modbus extension stopped",
-    );
-    expect(
-      statusLabel({ agent: "a", kind: "extension-outdated", missingMethods: ["get_snapshot"] }),
-    ).toBe("missing actions: get_snapshot");
-    expect(statusLabel({ agent: "a", kind: "no-interfaces" })).toBe("no interfaces configured");
-    expect(statusLabel({ agent: "a", kind: "discovering-interfaces" })).toBe(
-      "discovering interfaces…",
-    );
-  });
-});
+// ─── Remediation ────────────────────────────────────────────────────────────
 
 describe("remediation", () => {
   it("has no copy for healthy or in-flight agents", () => {

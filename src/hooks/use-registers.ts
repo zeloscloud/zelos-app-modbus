@@ -15,22 +15,21 @@ import type { ListRegistersResult } from "@/lib/types";
 const UNKNOWN_MAP_STALE_MS = 30_000;
 
 export function useRegisters(
-  bridge: BridgeTransport | null,
-  agent: string | null,
-  iface: string | null,
+  bridge: BridgeTransport,
+  agent: string,
+  iface: string,
   /** `map_name` from `list_interfaces`; null means raw-only (no catalog). */
   mapName: string | null,
+  /** `register_count` from `list_interfaces`. Part of the key because a restart
+   *  can swap the map's contents without changing its name, and this is the one
+   *  observable that moves when it does. */
+  registerCount: number,
 ): UseQueryResult<ListRegistersResult> {
-  const enabled = bridge !== null && agent !== null && iface !== null && mapName !== null;
   return useQuery<ListRegistersResult>({
-    queryKey: ["modbus-registers", agent, iface, mapName],
-    queryFn: async () => {
-      if (!bridge || !agent || !iface) {
-        throw new Error("useRegisters: bridge/agent/interface missing");
-      }
-      return await listRegisters(bridge, agent, iface);
-    },
-    enabled,
+    queryKey: ["modbus-registers", agent, iface, mapName, registerCount],
+    queryFn: async () => listRegisters(bridge, agent, iface),
+    // A raw-only interface has no catalog to fetch.
+    enabled: mapName !== null,
     staleTime: mapName !== null ? Number.POSITIVE_INFINITY : UNKNOWN_MAP_STALE_MS,
     refetchOnWindowFocus: false,
   });

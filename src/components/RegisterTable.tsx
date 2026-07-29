@@ -1,39 +1,115 @@
-/** The named-register screen: the interface's catalog grouped by trace event,
- *  with live values from the 1 Hz snapshot, an on-demand read per row, and an
- *  inline write editor on writable rows.
+/** The one table an interface has: every row the user added, named or raw, with
+ *  live values, an on-demand read and an inline write editor.
  *
- *  Two value sources are merged per register:
- *  - the snapshot's `values[path]`, which only contains registers the extension
- *    actually polls (`poll_interval: 0` registers are absent by design), and
- *  - a local "last read" overlay filled by the per-row Read button, which is the
- *    only way to see an unpolled register.
+ *  Two row kinds share the columns (see `lib/watch-store`):
  *
- *  The newer of the two wins. Snapshot timestamps come from the agent clock and
- *  overlay timestamps from the browser clock, so freshness is always measured
- *  against the matching reference (`captured_at_unix_ms` vs `Date.now()`) rather
- *  than mixing the two. */
+ *  - **named** rows join the catalog by path. Every metadata cell is read-only
+ *    because it comes from `list_registers`; a path the current map no longer has
+ *    renders as an orphan the user can delete rather than as stale metadata.
+ *  - **raw** rows are arbitrary-address access and own their metadata, so their
+ *    Address / Table / Type cells are the editors. Every edit commits to the
+ *    store as it happens — there is no configure-then-save step — and their
+ *    values are read on demand only and decoded client-side by `lib/codec`.
+ *
+ *  What a row *shows* is worked out in `lib/row-view` and arrives as one
+ *  `ValueState` and one `WriteModel`, so `ValueCell` and `WriteCell` serve both
+ *  kinds without knowing which they are serving. Rows are memoized on those
+ *  states: a keystroke re-renders one row, and a 1 Hz tick re-renders only the
+ *  rows whose value actually moved.
+ *
+ *  Column layout: Table, Type and Unit are as narrow as their content allows and
+ *  the space goes to Value and Write, the two columns the user works in. The
+ *  on-demand Read is icon-only and shares the Value cell with the value it
+ *  refreshes; Write owns its own column; Delete is a narrow column on the right.
+ *
+ *  The write draft is latched: it survives a successful write and every snapshot
+ *  re-render, so "type once, Write repeatedly" works. Only the user clears it,
+ *  and it is persisted, so duplicate rows act as presets.
+ *
+ *  Success has no toast anywhere on this screen — the value cell is the receipt.
+ *  A landed read flashes the value briefly (see {@link FLASH_MS}); a write is
+ *  confirmed by the value it produces, on the next poll or via a read-back (raw
+ *  rows and unpolled named rows have no poll to wait for). Toasts are reserved
+ *  for failures, all of them through `useAction`. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
-import { ChevronDown, ChevronRight, Lock, RefreshCw } from "lucide-react";
+import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import * as React from "react";
-import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { formatAddress, formatDecodedValue, physicalRange, validateWriteValue } from "@/lib/codec";
-import { reportActionFailure } from "@/lib/errors";
-import { readNamedRegister, writeNamedRegister } from "@/lib/modbus-bridge";
+import { useAction } from "@/hooks/use-action";
 import {
-  BIT_REGISTER_TYPES,
+  formatAddress,
+  formatDecodedValue,
+  isBitTable,
+  isByteOrder,
+  isModbusDatatype,
+  isRegisterTableType,
+  isWritableTable,
+  parseAddress,
+  parseWriteDraft,
+  physicalRange,
+  wordCount,
+} from "@/lib/codec";
+import {
+  readNamedRegister,
+  readRegister,
+  writeCoil,
+  writeNamedRegister,
+  writeRegisters,
+  writeSingleRegister,
+} from "@/lib/modbus-bridge";
+import {
+  BYTE_ORDER_LABELS,
+  TABLE_LABELS,
+  namedValueState,
+  namedWriteModel,
+  rawValueState,
+  rawWriteModel,
+  resolveValue,
+  sameValueState,
+  stalenessThresholdMs,
+  typeSummary,
+  writeDefault,
+  type Overlay,
+  type ValueState,
+  type WriteModel,
+} from "@/lib/row-view";
+import {
+  BYTE_ORDERS,
+  MODBUS_DATATYPES,
+  REGISTER_TYPES,
+  type ModbusDatatype,
   type ModbusSnapshot,
   type RegisterEntry,
   type RegisterTableType,
 } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import {
+  interpretRawRead,
+  planRawRead,
+  planRawWrite,
+  rawRowLabel,
+  rawTargetKey,
+  type NamedWatchRow,
+  type RawReadout,
+  type RawWatchRow,
+  type RowPatch,
+  type WatchRow,
+} from "@/lib/watch-store";
 
-/** Staleness cutoff when the effective poll interval is unknown or disabled. */
-const DEFAULT_STALE_MS = 5_000;
+/** How long a landed read holds its highlight before fading out. Long enough to
+ *  catch out of the corner of an eye, short enough to be gone by the next tick. */
+const FLASH_MS = 500;
+
+/** What the cell says instead of a number the wire couldn't carry. */
+const UNREPRESENTABLE_TITLE = "device returned a non-finite value (NaN/Inf)";
+
+/** Shared array identity, so a hint prop can't defeat the row memo. */
+const NOT_POLLED: readonly string[] = ["not polled"];
 
 export interface RegisterTableProps {
   bridge: BridgeTransport;
@@ -42,19 +118,22 @@ export interface RegisterTableProps {
   /** Interface default poll cadence in seconds — the fallback for registers
    *  whose own `poll_interval` is null. */
   interfacePollInterval: number;
+  /** The interface's catalog. Named rows join against it by path; nothing about a
+   *  register is ever copied into a stored row. Empty for a raw-only interface. */
   registers: readonly RegisterEntry[];
+  /** Rows for this (agent, interface), in insertion order. */
+  rows: readonly WatchRow[];
+  /** Whether {@link registers} is the catalog's real content. False while the
+   *  catalog is unavailable — during which a path that isn't in it is unknown,
+   *  not orphaned, and its row keeps working on the path alone. */
+  catalogReady: boolean;
   snapshot: ModbusSnapshot | undefined;
+  /** Commits an inline edit: a write draft on any row, metadata on a raw one. */
+  onUpdateRow: (id: string, patch: RowPatch) => void;
+  onRemoveRow: (id: string) => void;
+  /** Opens the add dialog — used by the empty state. */
+  onAdd: () => void;
 }
-
-type ValueSource = "poll" | "read";
-
-interface ResolvedValue {
-  value: number | boolean;
-  ts_ms: number;
-  source: ValueSource;
-}
-
-type Overlay = Readonly<Record<string, { value: number | boolean; ts_ms: number }>>;
 
 export function RegisterTable({
   bridge,
@@ -62,375 +141,779 @@ export function RegisterTable({
   interfaceName,
   interfacePollInterval,
   registers,
+  rows,
+  catalogReady,
   snapshot,
+  onUpdateRow,
+  onRemoveRow,
+  onAdd,
 }: RegisterTableProps) {
   const [overlay, setOverlay] = React.useState<Overlay>({});
-  const [collapsed, setCollapsed] = React.useState<ReadonlySet<string>>(() => new Set<string>());
 
-  const groups = React.useMemo(() => groupByEvent(registers), [registers]);
+  const byPath = React.useMemo(() => new Map(registers.map((reg) => [reg.path, reg])), [registers]);
 
-  const handleOverlay = React.useCallback((path: string, value: number | boolean) => {
-    setOverlay((prev) => ({ ...prev, [path]: { value, ts_ms: Date.now() } }));
+  // Read through a ref so the callback below can stay identity-stable for the
+  // memoized rows while still seeing the current tick.
+  const snapshotRef = React.useRef(snapshot);
+  snapshotRef.current = snapshot;
+
+  const handleOverlay = React.useCallback((path: string, value: number | boolean | null) => {
+    // Remember which poll sample this read overtook, in the agent's clock, so
+    // the poll can take the row back the moment it reports a newer one.
+    const supersedes = snapshotRef.current?.values[path]?.ts_ms ?? null;
+    setOverlay((prev) => ({ ...prev, [path]: { value, supersedes } }));
   }, []);
 
-  const toggleGroup = React.useCallback((event: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(event)) next.delete(event);
-      else next.add(event);
-      return next;
-    });
-  }, []);
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-md border border-dashed border-border bg-background/30 py-6 text-center text-sm text-muted-foreground">
+        <p>No rows yet — add a register or a raw address.</p>
+        <Button size="sm" variant="outline" className="mt-2 h-7 text-xs" onClick={onAdd}>
+          <Plus className="h-3 w-3" />
+          Add
+        </Button>
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-col gap-2">
-      {groups.map(({ event, registers: rows }) => {
-        const isCollapsed = collapsed.has(event);
-        return (
-          <div key={event} className="rounded-md border border-border">
-            <button
-              type="button"
-              onClick={() => toggleGroup(event)}
-              aria-expanded={!isCollapsed}
-              className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-accent/50"
-            >
-              {isCollapsed ? (
-                <ChevronRight className="h-3 w-3" />
-              ) : (
-                <ChevronDown className="h-3 w-3" />
-              )}
-              <span className="font-medium">{event}</span>
-              <span className="text-muted-foreground">
-                {rows.length} register{rows.length === 1 ? "" : "s"}
-              </span>
-            </button>
-
-            {!isCollapsed && (
-              <div className="overflow-x-auto border-t border-border">
-                <table className="w-full min-w-[720px] table-fixed text-xs">
-                  <colgroup>
-                    <col className="w-[20%]" />
-                    <col className="w-[110px]" />
-                    <col className="w-[86px]" />
-                    <col className="w-[16%]" />
-                    <col className="w-[52px]" />
-                    <col className="w-[16%]" />
-                    <col />
-                  </colgroup>
-                  <thead className="text-muted-foreground">
-                    <tr className="border-b border-border text-left">
-                      <Th>Name</Th>
-                      <Th>Address</Th>
-                      <Th>Table</Th>
-                      <Th>Type</Th>
-                      <Th>Unit</Th>
-                      <Th>Value</Th>
-                      <Th>Actions</Th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((reg) => (
-                      <RegisterRow
-                        key={`${reg.path}:${reg.address}:${reg.type}`}
-                        bridge={bridge}
-                        agentAddress={agentAddress}
-                        interfaceName={interfaceName}
-                        reg={reg}
-                        resolved={resolveValue(reg.path, snapshot, overlay)}
-                        thresholdMs={stalenessThresholdMs(reg.poll_interval, interfacePollInterval)}
-                        snapshotCapturedAt={snapshot?.captured_at_unix_ms ?? null}
-                        onValueRead={handleOverlay}
-                      />
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        );
-      })}
+    <div className="overflow-x-auto rounded-md border border-border">
+      <table className="w-full min-w-[860px] table-fixed text-xs">
+        {/* Table/Type/Unit are sized to the editors a raw row puts in them and no
+            more; every pixel saved there is spent on Value and Write. */}
+        <colgroup>
+          <col className="w-[20%]" />
+          <col className="w-[88px]" />
+          <col className="w-[76px]" />
+          <col className="w-[140px]" />
+          <col className="w-[40px]" />
+          <col className="w-[148px]" />
+          <col className="w-[168px]" />
+          <col className="w-[32px]" />
+        </colgroup>
+        <thead className="text-muted-foreground">
+          <tr className="border-b border-border text-left">
+            <Th>Register</Th>
+            <Th>Address</Th>
+            <Th>Table</Th>
+            <Th>Type</Th>
+            <Th>Unit</Th>
+            <Th>Value</Th>
+            <Th>Write</Th>
+            <Th>
+              <span className="sr-only">Delete</span>
+            </Th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            if (row.kind === "raw") {
+              return (
+                <RawRegisterRow
+                  key={row.id}
+                  bridge={bridge}
+                  agentAddress={agentAddress}
+                  interfaceName={interfaceName}
+                  row={row}
+                  onUpdateRow={onUpdateRow}
+                  onRemoveRow={onRemoveRow}
+                />
+              );
+            }
+            const reg = byPath.get(row.path) ?? null;
+            // Only a catalog we actually have can tell us a path is gone.
+            if (reg === null && catalogReady) {
+              return <OrphanRow key={row.id} row={row} onRemoveRow={onRemoveRow} />;
+            }
+            return (
+              <NamedRegisterRow
+                key={row.id}
+                bridge={bridge}
+                agentAddress={agentAddress}
+                interfaceName={interfaceName}
+                reg={reg}
+                row={row}
+                state={namedValueState(resolveValue(row.path, snapshot, overlay), {
+                  thresholdMs: stalenessThresholdMs(
+                    reg?.poll_interval ?? null,
+                    interfacePollInterval,
+                  ),
+                  snapshotCapturedAt: snapshot?.captured_at_unix_ms ?? null,
+                  polled: reg?.poll_interval !== 0,
+                })}
+                onValueRead={handleOverlay}
+                onUpdateRow={onUpdateRow}
+                onRemoveRow={onRemoveRow}
+              />
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-// ─── Row ────────────────────────────────────────────────────────────────────
+// ─── Named row ──────────────────────────────────────────────────────────────
 
-function RegisterRow({
+interface NamedRowProps {
+  bridge: BridgeTransport;
+  agentAddress: string;
+  interfaceName: string;
+  /** The catalog entry, or null when the catalog couldn't be loaded. The row
+   *  still works without it — every named action takes the path. */
+  reg: RegisterEntry | null;
+  row: NamedWatchRow;
+  state: ValueState;
+  onValueRead: (path: string, value: number | boolean | null) => void;
+  onUpdateRow: (id: string, patch: RowPatch) => void;
+  onRemoveRow: (id: string) => void;
+}
+
+function NamedRegisterRowView({
   bridge,
   agentAddress,
   interfaceName,
   reg,
-  resolved,
-  thresholdMs,
-  snapshotCapturedAt,
+  row,
+  state,
   onValueRead,
-}: {
-  bridge: BridgeTransport;
-  agentAddress: string;
-  interfaceName: string;
-  reg: RegisterEntry;
-  resolved: ResolvedValue | null;
-  thresholdMs: number;
-  snapshotCapturedAt: number | null;
-  onValueRead: (path: string, value: number | boolean) => void;
-}) {
-  const [busy, setBusy] = React.useState<"read" | "write" | null>(null);
-  const [draft, setDraft] = React.useState("");
-
-  const isBoolean = BIT_REGISTER_TYPES.has(reg.type) || reg.datatype === "bool";
-  const notPolled = reg.poll_interval === 0;
-  const stale =
-    resolved !== null &&
-    !notPolled &&
-    isStale(resolved, thresholdMs, snapshotCapturedAt) &&
-    resolved.source === "poll";
-
-  const debug = {
+  onUpdateRow,
+  onRemoveRow,
+}: NamedRowProps) {
+  const path = row.path;
+  const { flash, flashNow } = useValueFlash();
+  const { busy, run } = useAction<"read" | "write">(path, () => ({
     agent: agentAddress,
     interface: interfaceName,
-    register: {
-      path: reg.path,
-      address: reg.address,
-      type: reg.type,
-      datatype: reg.datatype,
-      scale: reg.scale,
-      byte_order: reg.byte_order,
-    },
-  };
+    register:
+      reg === null
+        ? { path, catalog: "unavailable" }
+        : {
+            path,
+            address: reg.address,
+            type: reg.type,
+            datatype: reg.datatype,
+            scale: reg.scale,
+            byte_order: reg.byte_order,
+          },
+  }));
 
-  async function handleRead() {
-    setBusy("read");
-    try {
-      const res = await readNamedRegister(bridge, agentAddress, interfaceName, reg.path);
-      if (res.value === null) throw new Error("the device returned no value");
-      onValueRead(reg.path, res.value);
-    } catch (e) {
-      reportActionFailure(`Read ${reg.path}`, e, debug);
-    } finally {
-      setBusy(null);
-    }
+  // Without the catalog we can't know whether anything polls this register, and
+  // an unpolled one would otherwise never show the value it was just given — so
+  // confirm with a read-back, which costs one action and is never wrong.
+  const readBackAfterWrite = reg === null || reg.poll_interval === 0;
+  const notPolled = reg?.poll_interval === 0;
+
+  /** A read landed: publish it and flash the value. The flash is the whole
+   *  success signal — no label, no toast, no reflow. A `null` value is a landed
+   *  read too (the device answered with a non-finite float), so it flashes like
+   *  any other; the cell says what it can't show. */
+  function acceptRead(value: number | boolean | null) {
+    onValueRead(path, value);
+    flashNow();
   }
 
-  async function handleWrite(value: number) {
-    setBusy("write");
-    try {
-      await writeNamedRegister(bridge, agentAddress, interfaceName, reg.path, value);
-      toast.success(`Wrote ${reg.path} = ${formatDecodedValue(isBoolean ? value !== 0 : value)}`);
-      setDraft("");
-      // Polled registers land on the next snapshot tick; unpolled ones would
-      // otherwise show nothing at all, so confirm with a read-back.
-      if (notPolled) {
-        const res = await readNamedRegister(bridge, agentAddress, interfaceName, reg.path);
-        if (res.value !== null) onValueRead(reg.path, res.value);
-      }
-    } catch (e) {
-      reportActionFailure(`Write ${reg.path}`, e, { ...debug, value });
-    } finally {
-      setBusy(null);
-    }
+  function handleWrite(value: number | boolean | bigint) {
+    // A named write is a JSON number; `parseWriteDraft` has already refused
+    // anything a double can't carry, so this conversion is exact.
+    const numeric = typeof value === "boolean" ? (value ? 1 : 0) : Number(value);
+    run(
+      "write",
+      async () => {
+        await writeNamedRegister(bridge, agentAddress, interfaceName, path, numeric);
+        // The draft is deliberately left as typed — repeating a setpoint is a
+        // normal bench move, so Write stays armed until the user edits or clears
+        // it. Polled registers land on the next snapshot tick; unpolled ones
+        // would otherwise show nothing at all, so confirm with a read-back.
+        // Either way the value cell is the only receipt the write gets, and it
+        // flashes even when the value it lands on is the one already showing.
+        if (readBackAfterWrite) {
+          const res = await readNamedRegister(bridge, agentAddress, interfaceName, path);
+          acceptRead(res.value);
+        } else {
+          flashNow();
+        }
+      },
+      { value: numeric },
+    );
   }
-
-  const range = physicalRange(reg.datatype, reg.scale);
-  const trimmed = draft.trim();
-  const parsed = trimmed.length === 0 ? null : Number(trimmed);
-  const verdict =
-    parsed === null || !Number.isFinite(parsed)
-      ? null
-      : validateWriteValue(parsed, reg.datatype, reg.scale);
-  const draftError =
-    trimmed.length === 0
-      ? null
-      : parsed === null || !Number.isFinite(parsed)
-        ? "not a number"
-        : verdict && !verdict.ok
-          ? verdict.error
-          : null;
 
   return (
     <tr className="border-b border-border/50 last:border-0">
       <Td>
-        <div className="truncate" title={reg.description || reg.path}>
-          {reg.name}
+        <div className="truncate font-mono text-[11px]" title={reg?.description || path}>
+          {path}
         </div>
-        {reg.description && (
-          <div className="truncate text-[10px] text-muted-foreground" title={reg.description}>
-            {reg.description}
-          </div>
-        )}
       </Td>
-      <Td className="font-mono text-[11px]">{formatAddress(reg.address)}</Td>
+      <Td className="font-mono text-[11px]">{reg === null ? "—" : formatAddress(reg.address)}</Td>
+      <MetaCell text={reg === null ? "—" : TABLE_LABELS[reg.type]} />
+      <MetaCell text={reg === null ? "—" : typeSummary(reg)} mono />
+      <MetaCell text={reg?.unit || "—"} title={reg?.unit || undefined} />
+      <ValueCell
+        state={state}
+        hints={notPolled && state.kind === "never" ? NOT_POLLED : undefined}
+        flash={flash}
+        busy={busy !== null}
+        reading={busy === "read"}
+        onRead={() =>
+          run("read", async () => {
+            const res = await readNamedRegister(bridge, agentAddress, interfaceName, path);
+            acceptRead(res.value);
+          })
+        }
+        readLabel={`Read ${path} from the device now`}
+      />
+      <WriteCell
+        model={reg === null ? BLIND_WRITE : namedWriteModel(reg)}
+        state={state}
+        label={path}
+        busy={busy !== null}
+        initialDraft={row.draft ?? ""}
+        onDraftChange={(draft) => onUpdateRow(row.id, { draft })}
+        onWrite={handleWrite}
+      />
       <Td>
-        <TableBadge type={reg.type} />
-      </Td>
-      <Td className="font-mono text-[11px] text-muted-foreground">
-        <div className="truncate" title={typeSummary(reg)}>
-          {typeSummary(reg)}
-        </div>
-      </Td>
-      <Td className="text-[11px] text-muted-foreground">{reg.unit || "—"}</Td>
-      <Td>
-        <div className={stale ? "opacity-40" : undefined}>
-          <span className="font-mono tabular-nums">
-            {resolved === null ? "—" : formatDecodedValue(resolved.value)}
-          </span>
-          {resolved !== null && reg.unit ? (
-            <span className="ml-1 text-[10px] text-muted-foreground">{reg.unit}</span>
-          ) : null}
-        </div>
-        {resolved !== null && resolved.source === "read" && (
-          <div className="text-[10px] text-muted-foreground">on demand</div>
-        )}
-        {notPolled && resolved === null && (
-          <div className="text-[10px] text-muted-foreground">not polled</div>
-        )}
-        {stale && <div className="text-[10px] text-muted-foreground">stale</div>}
-      </Td>
-      <Td>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-6 px-1.5 text-[11px]"
-            onClick={handleRead}
-            disabled={busy !== null}
-            title="Read this register from the device now"
-          >
-            <RefreshCw className={`h-3 w-3 ${busy === "read" ? "animate-spin" : ""}`} />
-            Read
-          </Button>
-
-          {!reg.writable ? (
-            <span
-              className="flex items-center gap-1 text-[10px] text-muted-foreground"
-              title={`${reg.type} registers are read-only`}
-            >
-              <Lock className="h-3 w-3" />
-              read-only
-            </span>
-          ) : isBoolean ? (
-            <Switch
-              checked={resolved?.value === true}
-              disabled={busy !== null}
-              onCheckedChange={(on) => void handleWrite(on ? 1 : 0)}
-              aria-label={`Write ${reg.path}`}
-              title={`Write ${reg.path} ON/OFF`}
-            />
-          ) : (
-            <>
-              <Input
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                placeholder={resolved === null ? "value" : formatDecodedValue(resolved.value)}
-                inputMode="decimal"
-                aria-label={`New value for ${reg.path}`}
-                title={`${formatDecodedValue(range.min)} … ${formatDecodedValue(range.max)}${
-                  reg.unit ? ` ${reg.unit}` : ""
-                }`}
-                className={`h-6 w-24 px-1.5 text-[11px] tabular-nums ${
-                  draftError ? "border-destructive" : ""
-                }`}
-              />
-              <Button
-                size="sm"
-                variant="default"
-                className="h-6 px-1.5 text-[11px]"
-                onClick={() => {
-                  if (parsed !== null && Number.isFinite(parsed) && !draftError) {
-                    void handleWrite(parsed);
-                  }
-                }}
-                disabled={busy !== null || trimmed.length === 0 || draftError !== null}
-              >
-                Write
-              </Button>
-              {draftError && (
-                <span className="text-[10px] text-destructive" role="alert">
-                  {draftError}
-                </span>
-              )}
-            </>
-          )}
-        </div>
+        <RemoveButton label={path} disabled={busy !== null} onRemove={() => onRemoveRow(row.id)} />
       </Td>
     </tr>
   );
 }
 
-// ─── Pure helpers ───────────────────────────────────────────────────────────
+/** Shared identity, for the same reason as {@link NOT_POLLED}. */
+const BLIND_WRITE: WriteModel = { kind: "blind" };
 
-/** Group registers by trace event, preserving the extension's ordering. */
-export function groupByEvent(
-  registers: readonly RegisterEntry[],
-): Array<{ event: string; registers: RegisterEntry[] }> {
-  const groups: Array<{ event: string; registers: RegisterEntry[] }> = [];
-  const index = new Map<string, number>();
-  for (const reg of registers) {
-    const existing = index.get(reg.event);
-    if (existing === undefined) {
-      index.set(reg.event, groups.length);
-      groups.push({ event: reg.event, registers: [reg] });
-    } else {
-      groups[existing]?.registers.push(reg);
-    }
+const NamedRegisterRow = React.memo(NamedRegisterRowView, sameRowProps);
+
+// ─── Raw row ────────────────────────────────────────────────────────────────
+
+interface RawRowProps {
+  bridge: BridgeTransport;
+  agentAddress: string;
+  interfaceName: string;
+  row: RawWatchRow;
+  onUpdateRow: (id: string, patch: RowPatch) => void;
+  onRemoveRow: (id: string) => void;
+}
+
+function RawRegisterRowView({
+  bridge,
+  agentAddress,
+  interfaceName,
+  row,
+  onUpdateRow,
+  onRemoveRow,
+}: RawRowProps) {
+  // The readout is tied to the target it came from: re-point the row and the old
+  // value stops being about this row, so the cell goes back to never-read
+  // without an effect firing on unrelated renders.
+  const [readout, setReadout] = React.useState<{ target: string; value: RawReadout } | null>(null);
+  const [addressDraft, setAddressDraft] = React.useState(row.address);
+  const { flash, flashNow } = useValueFlash();
+  const label = rawRowLabel(row);
+  const { busy, run } = useAction<"read" | "write">(label, () => ({
+    agent: agentAddress,
+    interface: interfaceName,
+    row,
+  }));
+
+  const bits = isBitTable(row.table);
+  const target = rawTargetKey(row);
+  const state = rawValueState(readout?.target === target ? readout.value : null);
+  // An address the user is still typing (or has typed wrong) is not an address to
+  // act on: the row would silently read or write the last committed one instead.
+  const addressReady = parseAddress(addressDraft) !== null;
+  const blocked = busy !== null || !addressReady;
+
+  function patch(next: RowPatch) {
+    onUpdateRow(row.id, next);
   }
-  return groups;
-}
 
-/** Newest of (snapshot value, on-demand read). */
-export function resolveValue(
-  path: string,
-  snapshot: ModbusSnapshot | undefined,
-  overlay: Overlay,
-): ResolvedValue | null {
-  const polled = snapshot?.values[path];
-  const read = overlay[path];
-  if (read && (!polled || read.ts_ms >= polled.ts_ms)) {
-    return { value: read.value, ts_ms: read.ts_ms, source: "read" };
+  /** Commit as the user types: a parseable address lands in the store
+   *  immediately; an unparseable one keeps its error ring and leaves the last
+   *  good value persisted. */
+  function editAddress(next: string) {
+    setAddressDraft(next);
+    if (next !== row.address && parseAddress(next) !== null) patch({ address: next });
   }
-  if (polled) return { value: polled.value, ts_ms: polled.ts_ms, source: "poll" };
-  return null;
-}
 
-/** ~3× the effective poll interval, falling back to 5 s when the interval is
- *  unknown or polling is disabled. */
-export function stalenessThresholdMs(
-  registerPollInterval: number | null,
-  interfacePollInterval: number,
-): number {
-  const seconds = registerPollInterval ?? interfacePollInterval;
-  if (!Number.isFinite(seconds) || seconds <= 0) return DEFAULT_STALE_MS;
-  return Math.max(3 * seconds * 1000, 1500);
-}
+  /** Read one value and show it. Throws, so `useAction` reports it. */
+  async function performRead() {
+    const planned = planRawRead(row);
+    if (!planned.ok) throw new Error(planned.error);
+    const res = await readRegister(bridge, agentAddress, interfaceName, {
+      address: planned.plan.address,
+      reg_type: planned.plan.table,
+      count: planned.plan.count,
+    });
+    setReadout({ target, value: interpretRawRead(row, res) });
+    flashNow();
+  }
 
-function isStale(
-  resolved: ResolvedValue,
-  thresholdMs: number,
-  snapshotCapturedAt: number | null,
-): boolean {
-  // Compare against the clock that produced the timestamp.
-  const reference = resolved.source === "poll" ? snapshotCapturedAt : Date.now();
-  if (reference === null) return false;
-  return reference - resolved.ts_ms > thresholdMs;
-}
+  function handleWrite(value: number | boolean | bigint) {
+    run(
+      "write",
+      async () => {
+        const planned = planRawWrite(row, value);
+        if (!planned.ok) throw new Error(planned.error);
+        const plan = planned.plan;
+        switch (plan.kind) {
+          case "coil":
+            await writeCoil(bridge, agentAddress, interfaceName, plan.address, plan.on);
+            break;
+          case "single":
+            await writeSingleRegister(bridge, agentAddress, interfaceName, plan.address, plan.word);
+            break;
+          case "multi":
+            await writeRegisters(bridge, agentAddress, interfaceName, plan.address, plan.words);
+            break;
+        }
+        // No poll stands behind a raw row, so the read-back is the only receipt.
+        await performRead();
+      },
+      { value },
+    );
+  }
 
-function typeSummary(reg: RegisterEntry): string {
-  const parts: string[] = [reg.datatype];
-  if (reg.byte_order !== "big") parts.push(reg.byte_order);
-  if (reg.scale !== 1) parts.push(`×${reg.scale}`);
-  return parts.join(" · ");
-}
-
-const TABLE_LABELS: Record<RegisterTableType, string> = {
-  holding: "holding",
-  input: "input",
-  coil: "coil",
-  discrete_input: "discrete",
-};
-
-function TableBadge({ type }: { type: RegisterTableType }) {
-  const writableTable = type === "holding" || type === "coil";
   return (
-    <Badge variant={writableTable ? "outline" : "secondary"} className="px-1.5 text-[10px]">
+    <tr className="border-b border-border/50 last:border-0">
+      <Td className="text-[11px] text-muted-foreground">
+        <span title="Raw row — an arbitrary address, not a register from the map">—</span>
+      </Td>
+      <Td>
+        <Input
+          value={addressDraft}
+          onChange={(e) => editAddress(e.target.value)}
+          onBlur={(e) => editAddress(e.target.value)}
+          aria-label="Raw address"
+          title="Address — decimal or 0x hex"
+          className={cn(
+            "h-6 w-full px-1.5 font-mono text-[11px]",
+            !addressReady && "border-destructive ring-1 ring-destructive",
+          )}
+        />
+      </Td>
+      <Td>
+        <RowSelect
+          value={row.table}
+          options={REGISTER_TYPES.map((table) => ({ value: table, label: TABLE_LABELS[table] }))}
+          onChange={(next) => {
+            if (isRegisterTableType(next)) patch({ table: next });
+          }}
+          label="Raw table"
+          title={`Modbus table — ${row.table}`}
+          className="w-full"
+        />
+      </Td>
+      <Td>
+        <div className="flex items-center gap-1">
+          <RowSelect
+            value={row.datatype}
+            options={MODBUS_DATATYPES.map((datatype) => ({ value: datatype, label: datatype }))}
+            onChange={(next) => {
+              if (isModbusDatatype(next)) patch({ datatype: next });
+            }}
+            label="Raw datatype"
+            disabled={bits}
+            title={
+              bits
+                ? `${row.table} addresses are single bits — always bool`
+                : `Datatype — ${row.datatype}`
+            }
+            className="min-w-0 flex-1"
+          />
+          {wordCount(row.datatype) > 1 && (
+            <RowSelect
+              value={row.byte_order}
+              options={BYTE_ORDERS.map((order) => ({
+                value: order,
+                label: BYTE_ORDER_LABELS[order],
+              }))}
+              onChange={(next) => {
+                if (isByteOrder(next)) patch({ byte_order: next });
+              }}
+              label="Raw word order"
+              title={`Word order — ${row.byte_order} (${BYTE_ORDER_LABELS[row.byte_order]})`}
+              className="shrink-0"
+            />
+          )}
+        </div>
+      </Td>
+      <MetaCell text="—" />
+      <ValueCell
+        state={state}
+        flash={flash}
+        busy={blocked}
+        reading={busy === "read"}
+        onRead={() => run("read", performRead)}
+        readLabel={`Read ${label} from the device now`}
+      />
+      <WriteCell
+        model={rawWriteModel(row)}
+        state={state}
+        label={label}
+        busy={blocked}
+        initialDraft={row.draft ?? ""}
+        onDraftChange={(draft) => patch({ draft })}
+        onWrite={handleWrite}
+      />
+      <Td>
+        <RemoveButton label={label} disabled={busy !== null} onRemove={() => onRemoveRow(row.id)} />
+      </Td>
+    </tr>
+  );
+}
+
+const RawRegisterRow = React.memo(RawRegisterRowView);
+
+/** A watched path the current register map doesn't have — the extension
+ *  restarted with a different config. Everything but Delete is meaningless, so
+ *  nothing else renders. */
+const OrphanRow = React.memo(function OrphanRow({
+  row,
+  onRemoveRow,
+}: {
+  row: WatchRow;
+  onRemoveRow: (id: string) => void;
+}) {
+  const path = row.kind === "named" ? row.path : row.id;
+  return (
+    <tr className="border-b border-border/50 text-muted-foreground last:border-0">
+      <Td>
+        <div className="truncate font-mono text-[11px]" title={path}>
+          {path}
+        </div>
+        <div className="text-[10px]">not in current register map</div>
+      </Td>
+      <Td colSpan={6} className="text-[11px]">
+        —
+      </Td>
+      <Td>
+        <RemoveButton label={path} onRemove={() => onRemoveRow(row.id)} />
+      </Td>
+    </tr>
+  );
+});
+
+// ─── Shared cells ───────────────────────────────────────────────────────────
+
+/** A ~500 ms highlight on the value that just landed. */
+function useValueFlash(): { flash: boolean; flashNow: () => void } {
+  const [flash, setFlash] = React.useState(false);
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  React.useEffect(
+    () => () => {
+      if (timer.current !== null) clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  const flashNow = React.useCallback(() => {
+    if (timer.current !== null) clearTimeout(timer.current);
+    setFlash(true);
+    timer.current = setTimeout(() => setFlash(false), FLASH_MS);
+  }, []);
+
+  return { flash, flashNow };
+}
+
+/** One of the narrow metadata columns: truncated, muted, its own tooltip. */
+function MetaCell({
+  text,
+  title,
+  mono = false,
+}: {
+  text: string;
+  title?: string | undefined;
+  mono?: boolean;
+}) {
+  return (
+    <Td className={cn("text-[10px] text-muted-foreground", mono && "font-mono")}>
+      <div className="truncate" title={title === undefined ? text : title}>
+        {text}
+      </div>
+    </Td>
+  );
+}
+
+/** The value, its hints, and the icon-only Read that refreshes it.
+ *
+ *  Everything the dash means is decided by the state it is handed: a sample that
+ *  never arrived and one that arrived unprintable look the same, but only the
+ *  second explains itself (tooltip + dotted underline), and only a sample that
+ *  arrived can be stale. */
+function ValueCell({
+  state,
+  hints,
+  flash,
+  busy,
+  reading,
+  onRead,
+  readLabel,
+}: {
+  state: ValueState;
+  hints?: readonly string[] | undefined;
+  flash: boolean;
+  busy: boolean;
+  reading: boolean;
+  onRead: () => void;
+  readLabel: string;
+}) {
+  const unrepresentable = state.kind === "unrepresentable";
+  const stale = state.kind === "value" && state.stale;
+  const text = state.kind === "value" ? formatDecodedValue(state.value) : "—";
+  const context = state.kind === "never" ? undefined : state.context;
+  const tooltip = unrepresentable
+    ? // Keep whatever context the row had (its raw words) after the reason.
+      [UNREPRESENTABLE_TITLE, context].filter(Boolean).join(" — ")
+    : state.kind === "value"
+      ? (context ?? text)
+      : undefined;
+
+  return (
+    <Td>
+      <div className="flex items-center gap-1.5">
+        <div className="min-w-0 flex-1">
+          {/* A landed read flashes here and fades out — the only success signal a
+              read or a write gets. Padding is constant so nothing reflows. */}
+          <div className={cn("min-w-0", stale && "opacity-40")} title={tooltip}>
+            <span
+              data-flash={flash ? "true" : undefined}
+              className={cn(
+                "-mx-1 inline-block max-w-full truncate rounded bg-transparent px-1 font-mono tabular-nums transition-colors duration-500 data-[flash=true]:bg-primary/25 data-[flash=true]:duration-0",
+                unrepresentable && "cursor-help underline decoration-dotted",
+              )}
+            >
+              {text}
+            </span>
+          </div>
+          {hints?.map((hint) => (
+            <div key={hint} className="text-[10px] text-muted-foreground">
+              {hint}
+            </div>
+          ))}
+          {stale && <div className="text-[10px] text-muted-foreground">stale</div>}
+        </div>
+        <Button
+          size="icon"
+          variant="outline"
+          className="h-6 w-6 shrink-0"
+          onClick={onRead}
+          disabled={busy}
+          title={readLabel}
+          aria-label={readLabel}
+        >
+          <RefreshCw className={cn("h-3 w-3", reading && "animate-spin")} />
+        </Button>
+      </div>
+    </Td>
+  );
+}
+
+/** The write column for either row kind, switched on the model it is handed: a
+ *  latched numeric draft plus Write for word registers, an ON/OFF switch for
+ *  bits, and a subdued dash where the table can't be written at all.
+ *
+ *  The draft lives here and is mirrored into the row on every keystroke, which is
+ *  what makes a row usable as a preset across reloads. It is seeded from the row
+ *  rather than driven by it so that typing re-renders one cell, not the table. */
+function WriteCell({
+  model,
+  state,
+  label,
+  busy,
+  initialDraft,
+  onDraftChange,
+  onWrite,
+}: {
+  model: WriteModel;
+  /** The value on show, for the placeholder and the switch position. */
+  state: ValueState;
+  /** Names the row in the controls' accessible labels. */
+  label: string;
+  busy: boolean;
+  /** The row's persisted draft, used to seed the editor once. */
+  initialDraft: string;
+  onDraftChange: (draft: string) => void;
+  onWrite: (value: number | boolean | bigint) => void;
+}) {
+  const [draft, setDraft] = React.useState(initialDraft);
+  const current = writeDefault(state);
+
+  if (model.kind === "readonly") {
+    return (
+      <Td>
+        <span className="cursor-default text-[11px] text-muted-foreground" title={model.why}>
+          <span aria-hidden="true">—</span>
+          <span className="sr-only">read-only</span>
+        </span>
+      </Td>
+    );
+  }
+
+  if (model.kind === "switch") {
+    return (
+      <Td>
+        <Switch
+          checked={current === true}
+          disabled={busy}
+          onCheckedChange={onWrite}
+          aria-label={`Write ${label}`}
+          title={`Write ${label} ON/OFF`}
+        />
+      </Td>
+    );
+  }
+
+  // One parse feeds the error, the button and the value sent — they can't
+  // disagree. With no catalog there is nothing to check against, so a blind
+  // editor only insists on a number and lets the extension have the last word.
+  const { value, error } =
+    model.kind === "blind"
+      ? blindDraft(draft)
+      : parseWriteDraft(draft, model.datatype, model.scale, model.wire);
+  const rangeHint =
+    model.kind === "blind"
+      ? "the register map is unavailable — this value is sent unchecked"
+      : hintRange(model.datatype, model.scale, model.unit);
+
+  return (
+    <Td>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Input
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            onDraftChange(e.target.value);
+          }}
+          placeholder={current === null ? "value" : formatDecodedValue(current)}
+          inputMode="decimal"
+          aria-label={`New value for ${label}`}
+          title={rangeHint}
+          className={cn("h-6 w-24 px-1.5 text-[11px] tabular-nums", error && "border-destructive")}
+        />
+        <Button
+          size="sm"
+          variant="default"
+          className="h-6 px-1.5 text-[11px]"
+          onClick={() => {
+            if (value !== null) onWrite(value);
+          }}
+          disabled={busy || value === null}
+        >
+          Write
+        </Button>
+        {error && (
+          <span className="w-full text-[10px] text-destructive" role="alert">
+            {error}
+          </span>
+        )}
+      </div>
+    </Td>
+  );
+}
+
+/** With no catalog there is no range and no scale to check — only "is it a
+ *  number". The extension validates and refuses on its side, and that refusal
+ *  toasts like any other. */
+function blindDraft(draft: string): { value: number | null; error: string | null } {
+  const trimmed = draft.trim();
+  if (trimmed.length === 0) return { value: null, error: null };
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return { value: null, error: "not a number" };
+  return { value: parsed, error: null };
+}
+
+function hintRange(datatype: ModbusDatatype, scale: number, unit: string): string {
+  const range = physicalRange(datatype, scale);
+  return `${formatDecodedValue(range.min)} … ${formatDecodedValue(range.max)}${unit ? ` ${unit}` : ""}`;
+}
+
+function RemoveButton({
+  label,
+  disabled = false,
+  onRemove,
+}: {
+  label: string;
+  /** Held while the row has a request in flight: deleting it mid-write would
+   *  leave the result of that write with nowhere to land. */
+  disabled?: boolean;
+  onRemove: () => void;
+}) {
+  return (
+    <Button
+      size="icon"
+      variant="ghost"
+      className="h-6 w-6"
+      onClick={onRemove}
+      disabled={disabled}
+      title={`Remove ${label} from the table`}
+      aria-label={`Remove ${label} from the table`}
+    >
+      <Trash2 className="h-3 w-3" />
+    </Button>
+  );
+}
+
+/** A native select sized for a table row. No portal and no pointer-capture
+ *  dance, and it stays exactly as tall as the row's other `h-6` controls. */
+function RowSelect({
+  value,
+  options,
+  onChange,
+  label,
+  title,
+  disabled = false,
+  className = "",
+}: {
+  value: string;
+  options: ReadonlyArray<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+  label: string;
+  title: string;
+  disabled?: boolean;
+  className?: string;
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      className={cn(
+        "h-6 rounded-md border border-input bg-background px-1 text-[11px] text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+        className,
+      )}
+    >
+      {options.map((option) => (
+        <option key={option.value} value={option.value} className="bg-background">
+          {option.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/** Row props are stable identities except the value state, which the poll
+ *  rebuilds every tick — so that one is compared by field and the rest by
+ *  reference. Generic over the prop bag, so a new prop can't silently escape the
+ *  comparison. */
+function sameRowProps<P extends { state: ValueState }>(prev: P, next: P): boolean {
+  const keys = Object.keys(prev) as Array<keyof P & string>;
+  if (keys.length !== Object.keys(next).length) return false;
+  return keys.every((key) =>
+    key === "state" ? sameValueState(prev.state, next.state) : prev[key] === next[key],
+  );
+}
+
+// ─── Shared with the picker ─────────────────────────────────────────────────
+
+/** The register picker's per-entry badge. The table prints the same label inline,
+ *  so both name a table the same. */
+export function TableBadge({ type }: { type: RegisterTableType }) {
+  return (
+    <Badge variant={isWritableTable(type) ? "outline" : "secondary"} className="px-1.5 text-[10px]">
       {TABLE_LABELS[type]}
     </Badge>
   );
@@ -440,6 +923,20 @@ function Th({ children }: { children: React.ReactNode }) {
   return <th className="py-1.5 px-1.5 font-medium">{children}</th>;
 }
 
-function Td({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <td className={`py-1.5 px-1.5 align-top ${className}`}>{children}</td>;
+/** Every cell centers on the row's height, so the text columns line up with
+ *  whichever control (Read, a select, the write input) made the row tall. */
+function Td({
+  children,
+  className = "",
+  colSpan,
+}: {
+  children: React.ReactNode;
+  className?: string;
+  colSpan?: number;
+}) {
+  return (
+    <td className={cn("py-1.5 px-1.5 align-middle", className)} {...(colSpan ? { colSpan } : {})}>
+      {children}
+    </td>
+  );
 }

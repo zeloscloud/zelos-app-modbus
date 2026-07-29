@@ -3,24 +3,23 @@
  *  InterfacePanel per interface the extension reported. */
 
 import { extensions, type BridgeTransport } from "@zeloscloud/app-extension-sdk";
-import { Play, Square } from "lucide-react";
-import * as React from "react";
+import { Loader2, Play, Square } from "lucide-react";
 
 import { InterfacePanel } from "@/components/InterfacePanel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useAction } from "@/hooks/use-action";
 import { remediation, type AgentStatus } from "@/lib/capability";
-import { reportActionFailure } from "@/lib/errors";
-import type { NewRawRow, RawRow } from "@/lib/raw-store";
+import type { NewWatchRow, RowPatch, WatchRow } from "@/lib/watch-store";
 
 export interface AgentPanelProps {
   bridge: BridgeTransport;
   agent: AgentStatus;
-  /** Raw rows already filtered to this agent. */
-  rows: readonly RawRow[];
-  onAddRow: (input: NewRawRow) => RawRow;
-  onUpdateRow: (id: string, patch: Partial<RawRow>) => void;
+  /** Table rows already filtered to this agent. */
+  rows: readonly WatchRow[];
+  onAddRow: (input: NewWatchRow) => WatchRow;
+  onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
   /** Re-runs the discovery queries so the UI reflects post-start/stop state. */
   onRefresh: () => void;
@@ -35,7 +34,9 @@ export function AgentPanel({
   onRemoveRow,
   onRefresh,
 }: AgentPanelProps) {
-  const interfaces = agent.kind === "ready" ? (agent.interfaces ?? []) : [];
+  // `interfaces` is only ever populated on a ready agent, so the kind check the
+  // resolver already made doesn't need making again here.
+  const interfaces = agent.interfaces ?? [];
   const fixIt = remediation(agent);
 
   return (
@@ -73,6 +74,13 @@ export function AgentPanel({
         {agent.kind === "discovering-interfaces" && (
           <p className="text-xs text-muted-foreground">Discovering interfaces…</p>
         )}
+
+        {agent.kind === "extension-starting" && (
+          <p className="text-xs text-muted-foreground">
+            The extension is running but hasn&apos;t registered its actions yet — this usually takes
+            a moment.
+          </p>
+        )}
       </CardHeader>
 
       {interfaces.length > 0 && (
@@ -102,12 +110,23 @@ function AgentBadge({ agent }: { agent: AgentStatus }) {
     case "ready":
     case "discovering-interfaces":
       return null;
+    case "extension-starting":
+      return (
+        <Badge variant="outline" className="gap-1 text-muted-foreground">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          extension starting
+        </Badge>
+      );
     case "extension-stopped":
       return <Badge variant="warning">extension stopped</Badge>;
     case "extension-outdated":
       return <Badge variant="warning">extension outdated</Badge>;
     case "no-interfaces":
       return <Badge variant="warning">no interfaces</Badge>;
+    case "discovery-failed":
+      return <Badge variant="destructive">discovery failed</Badge>;
+    case "nothing-registered":
+      return <Badge variant="warning">nothing registered</Badge>;
     case "extension-missing":
       return <Badge variant="destructive">extension not installed</Badge>;
   }
@@ -129,27 +148,23 @@ function ExtensionToggle({
   state: string;
   onRefresh: () => void;
 }) {
-  const [busy, setBusy] = React.useState<"start" | "stop" | null>(null);
   const isRunning = state === "running";
+  const { busy, run } = useAction<"start" | "stop">("Modbus extension", () => ({
+    agent: agentAddress,
+    extensionId,
+  }));
 
-  async function toggle() {
-    const op = isRunning ? "stop" : "start";
-    setBusy(op);
-    try {
-      if (isRunning) {
-        await extensions.stop(bridge, { id: extensionId, agent: agentAddress });
-      } else {
-        await extensions.start(bridge, { id: extensionId, agent: agentAddress });
+  function toggle() {
+    run(isRunning ? "stop" : "start", async () => {
+      try {
+        const target = { id: extensionId, agent: agentAddress };
+        if (isRunning) await extensions.stop(bridge, target);
+        else await extensions.start(bridge, target);
+      } finally {
+        // Refresh either way: a failed start still moved the extension's state.
+        onRefresh();
       }
-    } catch (e) {
-      reportActionFailure(`${op === "stop" ? "Stop" : "Start"} Modbus extension`, e, {
-        agent: agentAddress,
-        extensionId,
-      });
-    } finally {
-      setBusy(null);
-      onRefresh();
-    }
+    });
   }
 
   return (
