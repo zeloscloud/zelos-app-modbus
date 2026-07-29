@@ -17,12 +17,14 @@ const queryClient = new QueryClient({
 /** Installs the mock host scenario whenever the bridge enters standalone mode.
  *  Embedded mode is a no-op: the real desktop host owns invoke dispatch. */
 function MockHostBootstrap({ scenario }: { scenario: MockScenario }) {
-  const bridge = useZelosBridge();
+  const { status, mode, bridge } = useZelosBridge();
+  // Deliberately not the whole bridge object: it is rebuilt on every context
+  // update, and reinstalling the mock host would reset the simulated device.
   React.useEffect(() => {
-    if (bridge.status !== "ready" || bridge.mode !== "standalone") return;
-    if (!(bridge.bridge instanceof MockBridge)) return;
-    return installModbusMockHost(bridge.bridge, { scenario });
-  }, [bridge, scenario]);
+    if (status !== "ready" || mode !== "standalone") return;
+    if (!(bridge instanceof MockBridge)) return;
+    return installModbusMockHost(bridge, { scenario });
+  }, [status, mode, bridge, scenario]);
   return null;
 }
 

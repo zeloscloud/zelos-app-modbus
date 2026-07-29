@@ -6,9 +6,9 @@
  *  deliberate omission of unpolled registers, and raw words that decode through
  *  `lib/codec`. If the extension's shapes drift, these break before the UI does. */
 
-import type { BridgeTransport, MockBridge } from "@zeloscloud/app-extension-sdk";
+import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { actions, extensions } from "@zeloscloud/app-extension-sdk";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { decodeValue } from "@/lib/codec";
 import {
@@ -22,11 +22,13 @@ import {
   writeRegisters,
   writeSingleRegister,
 } from "@/lib/modbus-bridge";
+import { resolveAgentStatus } from "@/lib/capability";
 import { MODBUS_EXTENSION_ID, REQUIRED_MODBUS_METHODS, modbusActionPath } from "@/lib/types";
 
-import { installModbusMockHost, type MockScenario } from "./modbus-mock";
+import { installedMockBridge } from "./mock-bridge";
+import { STARTING_ACTIONS_MS, type MockScenario } from "./modbus-mock";
 
-const AGENT = "localhost:2300";
+const AGENT = "localhost";
 
 let teardown: (() => void) | null = null;
 
@@ -35,28 +37,10 @@ afterEach(() => {
   teardown = null;
 });
 
-/** Install the mock on a minimal MockBridge stand-in and return a transport that
- *  routes `invoke` straight at the installed handler. */
 function makeHost(scenario: MockScenario = "ready"): BridgeTransport {
-  let handler: ((method: string, params: unknown) => unknown | Promise<unknown>) | null = null;
-  const mock = {
-    setInvokeHandler(next: typeof handler) {
-      handler = next;
-    },
-  } as unknown as MockBridge;
-  teardown = installModbusMockHost(mock, { scenario });
-  return {
-    mode: "standalone",
-    invoke: async (method: string, params?: unknown) => {
-      if (!handler) throw new Error("mock host has no invoke handler");
-      return await handler(method, params);
-    },
-    getSnapshot: () => {
-      throw new Error("unused in tests");
-    },
-    on: () => () => {},
-    destroy: () => {},
-  } as unknown as BridgeTransport;
+  const installed = installedMockBridge(scenario);
+  teardown = installed.teardown;
+  return installed.bridge;
 }
 
 describe("discovery surface", () => {
@@ -80,11 +64,26 @@ describe("discovery surface", () => {
     expect(paths).not.toContain(modbusActionPath("list_registers"));
   });
 
-  it("advertises no actions while stopped, and the full set after start", async () => {
+  it("runs with no actions for a moment after start, then registers the full set", async () => {
     const bridge = makeHost("extension-stopped");
     expect((await actions.list(bridge))[AGENT]).toEqual([]);
     await extensions.start(bridge, { id: MODBUS_EXTENSION_ID, agent: AGENT });
-    expect((await actions.list(bridge))[AGENT]).toContain(modbusActionPath("get_snapshot"));
+
+    // The gap a real extension leaves between "running" and "registered": the
+    // process is up, and `actions.list` still has nothing to say about it.
+    expect((await extensions.list(bridge))[AGENT]?.[0]?.state).toBe("running");
+    expect((await actions.list(bridge))[AGENT]).toEqual([]);
+    expect(
+      resolveAgentStatus(AGENT, (await extensions.list(bridge))[AGENT] ?? [], [], undefined).kind,
+    ).toBe("extension-starting");
+
+    // Once the window closes, everything is there.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + STARTING_ACTIONS_MS + 1);
+    try {
+      expect((await actions.list(bridge))[AGENT]).toContain(modbusActionPath("get_snapshot"));
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("reports a mapped interface and a raw-only one", async () => {
@@ -136,6 +135,16 @@ describe("snapshot", () => {
     expect(snapshot.values["status/relay1"]?.value).toBe(true);
     expect(snapshot.values["setpoints/energy_reset"]).toBeUndefined();
   });
+
+  it("sends a non-finite value as null, keeping the register in the snapshot", async () => {
+    const bridge = makeHost("ready");
+    const snapshot = await getSnapshot(bridge, AGENT, "meter");
+    const sanitized = snapshot.values["status/spare_sensor"];
+    // Present (it was polled) but with nothing JSON can carry.
+    expect(sanitized).toBeDefined();
+    expect(sanitized?.value).toBeNull();
+    expect(sanitized?.ts_ms).toBeGreaterThan(0);
+  });
 });
 
 describe("named read/write", () => {
@@ -143,6 +152,14 @@ describe("named read/write", () => {
     const bridge = makeHost("ready");
     const res = await readNamedRegister(bridge, AGENT, "meter", "setpoints/energy_reset");
     expect(res).toMatchObject({ address: 104, type: "holding", datatype: "uint32", value: 0 });
+  });
+
+  it("reads a NaN register as a successful null, not as a failure", async () => {
+    const bridge = makeHost("ready");
+    const res = await readNamedRegister(bridge, AGENT, "meter", "status/spare_sensor");
+    // `unwrap` would have thrown on success: false — this is a good read of a
+    // value that has no JSON form.
+    expect(res).toMatchObject({ address: 22, datatype: "float32", value: null, success: true });
   });
 
   it("persists a write and reflects it in later reads and snapshots", async () => {
@@ -272,11 +289,39 @@ describe("raw access", () => {
   });
 });
 
+describe("extension quirks the mock mirrors", () => {
+  it("falls through to discrete inputs on a table name it doesn't know", async () => {
+    // The extension's branch is if/elif/else over three names; the else is
+    // discrete_input, so an unknown table reads bits, not holding registers.
+    const bridge = makeHost("ready");
+    const res = await readRegister(bridge, AGENT, "meter", {
+      address: 0,
+      reg_type: "nonsense" as never,
+      count: 2,
+    });
+    expect(res.values).toEqual([false, false]);
+    expect(res.type).toBe("discrete_input");
+  });
+
+  it("refuses a partly numeric word list, the way Python's int() does", async () => {
+    const bridge = makeHost("ready");
+    await expect(writeRegisters(bridge, AGENT, "meter", 300, [1])).resolves.toBeTruthy();
+    // `parseInt` would read "12abc" as 12 and write a word nobody asked for, so
+    // the whole request is refused in-band instead.
+    const res = await actions.execute(bridge, {
+      agent: AGENT,
+      action: modbusActionPath("write_registers"),
+      params: { interface: "meter", address: 300, values: "12abc,3" },
+    });
+    expect(res.result).toMatchObject({ success: false, error: /comma-separated integers/ });
+  });
+});
+
 describe("multi-agent scenario", () => {
   it("gives one ready agent and one without the extension", async () => {
     const bridge = makeHost("multi-agent");
     const installed = await extensions.list(bridge);
-    expect(installed["localhost:2300"]).toEqual([]);
+    expect(installed["localhost"]).toEqual([]);
     expect(installed["remote:2300"]?.[0]?.state).toBe("running");
     expect((await listInterfaces(bridge, "remote:2300")).count).toBe(2);
   });

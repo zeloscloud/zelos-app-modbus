@@ -158,6 +158,31 @@ export async function writeCoil(
 
 // ─── Internals ──────────────────────────────────────────────────────────────
 
+/** A Modbus action that didn't work, with the pieces of the failure kept apart
+ *  instead of flattened into prose: the message stays exactly what it always
+ *  was, and the failure UX gets fields to read rather than a string to scrape. */
+export class ModbusActionError extends Error {
+  /** Action name, e.g. `write_named_register`. */
+  readonly method: string;
+  /** The envelope's status, or null when the envelope resolved and the payload
+   *  itself reported `success: false`. */
+  readonly status: string | null;
+  /** Whatever the agent said about the cause, if it said anything. */
+  readonly detail: string | null;
+
+  constructor(method: string, status: string | null, detail: string | null) {
+    super(
+      status === null
+        ? `Modbus ${method} failed: ${detail ?? "the extension reported success: false"}`
+        : `Modbus ${method} failed: status=${status}${detail === null ? "" : `, ${detail}`}`,
+    );
+    this.name = "ModbusActionError";
+    this.method = method;
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function call<T>(
   bridge: BridgeTransport,
   agent: string,
@@ -174,16 +199,17 @@ async function call<T>(
 
 function unwrap<T>(res: ModbusActionResult<T>, method: string): T {
   if (res.status !== "pass" && res.status !== "done") {
-    throw new Error(`Modbus ${method} failed: status=${res.status}${detailSuffix(res.result)}`);
+    throw new ModbusActionError(method, res.status, resultDetail(res.result));
   }
   // The extension's own failure channel: a resolved action whose payload says
   // `success: false`. Treat it exactly like a failed status.
   if (res.result !== null && typeof res.result === "object") {
     const payload = res.result as ModbusErrorPayload;
     if (payload.success === false) {
-      const detail = typeof payload.error === "string" ? payload.error : null;
-      throw new Error(
-        `Modbus ${method} failed: ${detail ?? "the extension reported success: false"}`,
+      throw new ModbusActionError(
+        method,
+        null,
+        typeof payload.error === "string" ? payload.error : null,
       );
     }
   }
@@ -194,22 +220,20 @@ function unwrap<T>(res: ModbusActionResult<T>, method: string): T {
  *  shapes (a `{reason}` object, a raw string, or just the error dict). Falling
  *  back to JSON.stringify keeps the surface useful when the shape is unfamiliar
  *  so bug reports include the actual failure. */
-function detailSuffix(result: unknown): string {
-  let detail: string | null = null;
+function resultDetail(result: unknown): string | null {
   if (result !== null && typeof result === "object") {
-    if ("error" in result) {
-      detail = String((result as { error: unknown }).error);
-    } else if ("reason" in result) {
-      detail = String((result as { reason: unknown }).reason);
-    } else {
-      try {
-        detail = JSON.stringify(result);
-      } catch {
-        // ignore
-      }
+    if ("error" in result) return nonEmpty(String((result as { error: unknown }).error));
+    if ("reason" in result) return nonEmpty(String((result as { reason: unknown }).reason));
+    try {
+      return nonEmpty(JSON.stringify(result) ?? "");
+    } catch {
+      return null;
     }
-  } else if (typeof result === "string" && result.length > 0) {
-    detail = result;
   }
-  return detail ? `, ${detail}` : "";
+  if (typeof result === "string") return nonEmpty(result);
+  return null;
+}
+
+function nonEmpty(text: string): string | null {
+  return text.length > 0 ? text : null;
 }

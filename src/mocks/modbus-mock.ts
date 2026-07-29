@@ -16,11 +16,19 @@
 
 import type { MockBridge } from "@zeloscloud/app-extension-sdk";
 
-import { decodeValue, encodeValue, isBitTable, wordCount } from "@/lib/codec";
+import {
+  MAX_READ_COUNT,
+  decodeValue,
+  encodeValue,
+  isBitTable,
+  isRegisterTableType,
+  wordCount,
+} from "@/lib/codec";
 import {
   MODBUS_EXTENSION_ID,
   MODBUS_METHODS,
   REQUIRED_MODBUS_METHODS,
+  modbusActionPath,
   type ByteOrder,
   type ModbusDatatype,
   type ModbusInterfaceEntry,
@@ -38,11 +46,20 @@ export type MockScenario =
 
 export interface MockHostOptions {
   /** Which capability state to simulate. `"multi-agent"` makes `remote:2300`
-   *  ready and `localhost:2300` missing the extension. */
+   *  ready and `localhost` (the local agent's key, as the real host reports it)
+   *  missing the extension. */
   scenario?: MockScenario;
 }
 
 const TICK_MS = 1_000;
+
+/** How long a freshly started extension runs with no actions registered. Longer
+ *  than one 5 s discovery cycle, so the app has to render the state rather than
+ *  blink past it. */
+export const STARTING_ACTIONS_MS = 6_000;
+
+/** Holding address of `status/spare_sensor`, the register that reads NaN. */
+const NAN_ADDRESS = 22;
 
 /** Action set advertised by `actions.list`: the current extension, a 0.1.4-era
  *  extension (no list_interfaces / get_snapshot / list_registers), or nothing. */
@@ -123,6 +140,16 @@ const REGISTER_DEFS: RegisterDef[] = [
     scale: 0.1,
     description: "PCB temperature, 0.1 °C per raw count",
     live: (t) => 41 + 2 * Math.sin(t / 13),
+  },
+  {
+    event: "status",
+    name: "spare_sensor",
+    address: 22,
+    datatype: "float32",
+    unit: "°C",
+    description: "Unpopulated sensor input — the device reports NaN",
+    // Seeded straight into memory as 0xffff 0xffff (see buildMeter): there is no
+    // physical value to encode, which is the whole point of this register.
   },
   { event: "status", name: "relay1", address: 0, type: "coil", seed: true },
   { event: "status", name: "relay2", address: 1, type: "coil", seed: false },
@@ -245,8 +272,9 @@ interface SimInterface {
   defs: RegisterDef[];
   registers: RegisterEntry[];
   memory: Memory;
-  /** Last-polled cache — exactly what get_snapshot serves. */
-  values: Map<string, { value: number | boolean; ts_ms: number }>;
+  /** Last-polled cache — exactly what get_snapshot serves, `null` values and
+   *  all. */
+  values: Map<string, { value: number | boolean | null; ts_ms: number }>;
   poll_count: number;
   error_count: number;
 }
@@ -257,6 +285,9 @@ interface SimAgent {
   extVersion: string;
   extState: "installed" | "running" | "stopped" | "failed";
   actionSet: ActionSet;
+  /** While set and in the future, the extension is running but has registered
+   *  nothing — the window every real Start passes through. */
+  actionsReadyAt: number | null;
   interfaces: Map<string, SimInterface>;
 }
 
@@ -292,12 +323,17 @@ function buildMeter(): SimInterface {
     error_count: 0,
   };
   // Seed device memory, then run one poll sweep so the first snapshot has values.
+  // `registers[i]` is `toEntry(REGISTER_DEFS[i])` — built once, above.
   REGISTER_DEFS.forEach((def, i) => {
-    const entry = toEntry(def);
+    const entry = registers[i];
     const seeded = def.live ? def.live(0, i) : def.seed;
-    if (seeded === undefined) return;
+    if (entry === undefined || seeded === undefined) return;
     writeMemory(iface.memory, entry, seeded);
   });
+  // status/spare_sensor: all-ones words, i.e. a float32 NaN. `writeMemory` can't
+  // put one there (encoding NaN throws, correctly), so the words go in directly.
+  iface.memory.holding.set(NAN_ADDRESS, 0xffff);
+  iface.memory.holding.set(NAN_ADDRESS + 1, 0xffff);
   pollSweep(iface, Date.now());
   return iface;
 }
@@ -333,6 +369,7 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
     extVersion: "0.1.5",
     extState: "running",
     actionSet: "full",
+    actionsReadyAt: null,
     interfaces: new Map([
       ["meter", buildMeter()],
       ["probe", buildProbe()],
@@ -350,6 +387,7 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
         extVersion: "0.0.0",
         extState: "installed",
         actionSet: "none",
+        actionsReadyAt: null,
         interfaces: new Map(),
       };
     case "extension-stopped":
@@ -374,7 +412,11 @@ function writeMemory(memory: Memory, reg: RegisterEntry, value: number | boolean
   words.forEach((word, i) => table.set(reg.address + i, word));
 }
 
-function readMemory(memory: Memory, reg: RegisterEntry): number | boolean {
+/** Decode one register out of device memory, the way the extension does — and
+ *  then sanitize it the way the extension's action boundary does: a non-finite
+ *  float (an unpopulated sensor reading 0xffff 0xffff, say) has no JSON form, so
+ *  it goes over the wire as `null` rather than failing the whole action. */
+function readMemory(memory: Memory, reg: RegisterEntry): number | boolean | null {
   if (isBitTable(reg.type)) {
     const table = reg.type === "coil" ? memory.coil : memory.discrete_input;
     return table.get(reg.address) ?? false;
@@ -385,7 +427,8 @@ function readMemory(memory: Memory, reg: RegisterEntry): number | boolean {
     words.push(table.get(reg.address + i) ?? 0);
   }
   const decoded = decodeValue(words, reg.datatype, reg.scale, reg.byte_order);
-  return typeof decoded === "bigint" ? Number(decoded) : decoded;
+  const value = typeof decoded === "bigint" ? Number(decoded) : decoded;
+  return typeof value === "number" && !Number.isFinite(value) ? null : value;
 }
 
 function readRange(
@@ -421,8 +464,9 @@ function pollSweep(iface: SimInterface, now: number): void {
  *  registers (setpoints, coils, calibration) keep whatever was written to them. */
 function tick(iface: SimInterface, elapsedSeconds: number): void {
   iface.defs.forEach((def, i) => {
-    if (!def.live) return;
-    writeMemory(iface.memory, toEntry(def), def.live(elapsedSeconds, i));
+    const entry = iface.registers[i];
+    if (!def.live || entry === undefined) return;
+    writeMemory(iface.memory, entry, def.live(elapsedSeconds, i));
   });
   pollSweep(iface, Date.now());
 }
@@ -434,8 +478,8 @@ export function installModbusMockHost(bridge: MockBridge, opts: MockHostOptions 
   const scenario: MockScenario = opts.scenario ?? "ready";
   const agents: SimAgent[] =
     scenario === "multi-agent"
-      ? [buildAgent("localhost:2300", "extension-missing"), buildAgent("remote:2300", "ready")]
-      : [buildAgent("localhost:2300", scenario)];
+      ? [buildAgent("localhost", "extension-missing"), buildAgent("remote:2300", "ready")]
+      : [buildAgent("localhost", scenario)];
 
   const agentMap = new Map(agents.map((a) => [a.address, a]));
   const startedAt = Date.now();
@@ -487,13 +531,16 @@ function buildExtensionsList(agentMap: Map<string, SimAgent>) {
 function buildActionsList(agentMap: Map<string, SimAgent>) {
   const out: Record<string, string[]> = {};
   for (const [addr, a] of agentMap) {
+    // Running, but still inside its registration window: the process is up and
+    // not one action exists yet.
+    const starting = a.actionsReadyAt !== null && Date.now() < a.actionsReadyAt;
     const methods =
-      a.actionSet === "none"
+      a.actionSet === "none" || starting
         ? []
         : a.actionSet === "legacy"
           ? LEGACY_ACTIONS
           : [...REQUIRED_MODBUS_METHODS, MODBUS_METHODS.getStatus];
-    out[addr] = methods.map((m) => `modbus/${m}`);
+    out[addr] = methods.map((m) => modbusActionPath(m));
   }
   return out;
 }
@@ -511,7 +558,7 @@ function handleExtensionLifecycle(
   if (typeof id !== "string" || id.length === 0) {
     throw new Error(`mock-host: ${op} requires non-empty string id`);
   }
-  const addr = typeof agentAddr === "string" && agentAddr.length > 0 ? agentAddr : "localhost:2300";
+  const addr = typeof agentAddr === "string" && agentAddr.length > 0 ? agentAddr : "localhost";
   const agent = agentMap.get(addr);
   if (!agent) throw new Error(`mock-host: unknown agent "${addr}"`);
   if (!agent.extInstalled) {
@@ -520,10 +567,15 @@ function handleExtensionLifecycle(
   if (op === "start") {
     agent.extState = "running";
     agent.actionSet = scenario === "extension-outdated" ? "legacy" : "full";
+    // A real extension is running before it has registered anything, and the
+    // gap outlives a poll cycle. Reproduce it, so "starting" is a state the app
+    // is actually exercised against instead of a state nobody ever sees.
+    agent.actionsReadyAt = Date.now() + STARTING_ACTIONS_MS;
     return { pid: 4321 };
   }
   agent.extState = "stopped";
   agent.actionSet = "none";
+  agent.actionsReadyAt = null;
   return undefined;
 }
 
@@ -566,7 +618,7 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
 
   switch (method) {
     case MODBUS_METHODS.getSnapshot: {
-      const values: Record<string, { value: number | boolean; ts_ms: number }> = {};
+      const values: Record<string, { value: number | boolean | null; ts_ms: number }> = {};
       for (const [path, entry] of iface.values) values[path] = entry;
       return {
         status: "done",
@@ -636,12 +688,14 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
     case MODBUS_METHODS.readRegister: {
       const address = Number(args.address);
       const count = Number(args.count ?? 1);
-      const type = asTable(args.reg_type);
+      // The extension's own branch is if/elif/else over the three named tables,
+      // so anything unrecognized lands on the final else — discrete inputs.
+      const type = isRegisterTableType(args.reg_type) ? args.reg_type : "discrete_input";
       if (!Number.isInteger(address) || address < 0 || address > 65535) {
         return failure(`Address ${String(args.address)} out of range`);
       }
-      if (!Number.isInteger(count) || count < 1 || count > 125) {
-        return failure(`Count ${String(args.count)} out of range 1…125`);
+      if (!Number.isInteger(count) || count < 1 || count > MAX_READ_COUNT) {
+        return failure(`Count ${String(args.count)} out of range 1…${MAX_READ_COUNT}`);
       }
       return {
         status: "done",
@@ -668,7 +722,12 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
     case MODBUS_METHODS.writeRegisters: {
       const address = Number(args.address);
       const text = typeof args.values === "string" ? args.values : "";
-      const parsed = text.split(",").map((v) => Number.parseInt(v.trim(), 10));
+      // Python's `int()` takes the whole string or nothing — `parseInt` would
+      // read "12abc" as 12 and write a word the caller never asked for.
+      const fields = text.split(",").map((v) => v.trim());
+      const parsed = fields.map((v) =>
+        /^[+-]?\d+$/.test(v) ? Number.parseInt(v, 10) : Number.NaN,
+      );
       if (!Number.isInteger(address) || parsed.some((v) => !Number.isInteger(v))) {
         return failure("Values must be comma-separated integers");
       }
@@ -693,23 +752,9 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
       return { status: "done", result: { address, value: on, success: true } };
     }
 
-    case MODBUS_METHODS.getStatus:
-      return done({
-        interface: ifaceName,
-        connected: iface.entry.connected,
-        transport: iface.entry.transport,
-        connection: iface.entry.connection,
-        unit_id: iface.entry.unit_id,
-        poll_count: iface.poll_count,
-        error_count: iface.error_count,
-        poll_interval: iface.entry.poll_interval,
-        write_mode: iface.entry.write_mode,
-        block_reads: true,
-        max_block_size: 125,
-        max_read_gap: 0,
-        registers: iface.registers.length,
-      });
-
+    // `get_status` stays in the advertised action list (a 0.1.4-era extension is
+    // recognized by it) but nothing in the app calls it: the header reads
+    // `get_snapshot`, which carries the same counters.
     default:
       throw new Error(`mock-host: unknown method "${method}"`);
   }
@@ -718,15 +763,4 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
 function findRegister(iface: SimInterface, name: unknown): RegisterEntry | undefined {
   if (typeof name !== "string") return undefined;
   return iface.registers.find((r) => r.path === name || r.name === name);
-}
-
-function asTable(value: unknown): RegisterTableType {
-  switch (value) {
-    case "input":
-    case "coil":
-    case "discrete_input":
-      return value;
-    default:
-      return "holding";
-  }
 }

@@ -5,27 +5,25 @@ Read and write Modbus registers from the Zelos desktop app — pairs with the
 agent extension (0.1.5+).
 
 - 🛰️ One card per agent, one section per interface (TCP / RTU) with live connection + poll counters
-- 📇 Named registers grouped by event: address (dec + hex), table, datatype, unit, live value
-- 🔄 On-demand **Read** per register — the only way to see `poll_interval: 0` registers
-- ✏️ Inline **Write** on writable rows, range-checked before it hits the wire; coils as a switch
-- 🧮 **Raw access** rows at any address, typed client-side and saved between sessions
-- 🔔 Failures toast with a humanized message and copy-details JSON
+- 📇 One table per interface: registers from the map and raw addresses, side by side, saved between sessions
+- 🔄 On-demand **Read** per row — the only way to see `poll_interval: 0` registers
+- ✏️ Inline **Write**, range-checked before it hits the wire; coils as a switch; the typed value sticks, so duplicate rows act as presets
+- 🔔 Failures toast with a humanized message and copy-details JSON; successes just show the new value
 
-## Named registers
+## The table
 
-| Column  | Notes                                                             |
-| ------- | ----------------------------------------------------------------- |
-| Address | Decimal + hex, e.g. `100 (0x0064)`                                |
-| Table   | `holding` / `input` / `coil` / `discrete` — inputs are read-only  |
-| Type    | Datatype, plus word order and scale when they aren't the defaults |
-| Value   | From the 1 Hz snapshot, dimmed when older than ~3× the poll rate  |
+| Column  | Notes                                                                  |
+| ------- | ---------------------------------------------------------------------- |
+| Address | Decimal + hex, e.g. `100 (0x0064)`                                     |
+| Table   | `holding` / `input` / `coil` / `discrete` — inputs are read-only       |
+| Type    | Datatype, plus word order and scale when they aren't the defaults      |
+| Value   | Named rows from the 1 Hz snapshot, dimmed past ~3× the poll rate       |
+| Write   | Value + **Write**, a switch for bits, `—` where the table is read-only |
 
-## Raw access
-
-| Row       | Fields                                                     | Wire                                 |
-| --------- | ---------------------------------------------------------- | ------------------------------------ |
-| **Read**  | address, table, datatype, word order, scale, count         | `read_register`, decoded client-side |
-| **Write** | address, register/coil, datatype, word order, scale, value | FC6 / FC16 / FC5 by width and target |
+**Add** picks a register out of the map, or starts a **raw row** — any address, with its table,
+datatype and word order edited inline in the row and committed as you go. Raw rows have no poll
+behind them: they read on demand (`read_register`, decoded client-side) and write FC6 / FC16 / FC5
+by width and table.
 
 Values are decoded and encoded by `src/lib/codec.ts`, a 1:1 port of the extension's
 `decode_value` / `encode_value` (including its scaled-integer truncation), so a raw read of a

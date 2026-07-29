@@ -1,38 +1,40 @@
-/** One section per Modbus interface: a live status header, then either the named
- *  register table or the raw-access rows.
+/** One section per Modbus interface: a live status header, then the one table
+ *  holding every row the user added to it — catalog registers and arbitrary
+ *  addresses side by side, in insertion order.
  *
- *  An interface with no register map (`map_name === null`) has nothing to put in
- *  the Registers tab, so it renders raw access only. */
+ *  An interface with no register map (`map_name === null`) is not a special case
+ *  any more: its catalog is simply empty, so only raw rows can be added to it. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
-import { AlertCircle, Loader2 } from "lucide-react";
+import { AlertCircle, Loader2, Plus } from "lucide-react";
 import * as React from "react";
 
-import { RawPanel } from "@/components/RawPanel";
+import { AddRegisterDialog } from "@/components/AddRegisterDialog";
 import { RegisterTable } from "@/components/RegisterTable";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useRegisters } from "@/hooks/use-registers";
 import { useSnapshot } from "@/hooks/use-snapshot";
-import type { NewRawRow, RawRow } from "@/lib/raw-store";
-import type { ModbusInterfaceEntry } from "@/lib/types";
+import type { ModbusInterfaceEntry, RegisterEntry } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { defaultRawRow, type NewWatchRow, type RowPatch, type WatchRow } from "@/lib/watch-store";
 
 /** How long a snapshot response can go unrefreshed before the dot goes amber.
  *  The poll runs at 1 Hz, so 5 s means "several cycles have failed or stalled". */
 const SNAPSHOT_STALE_MS = 5_000;
 
+const NO_REGISTERS: readonly RegisterEntry[] = [];
+
 export interface InterfacePanelProps {
   bridge: BridgeTransport;
   agentAddress: string;
   iface: ModbusInterfaceEntry;
-  /** Raw rows already filtered to this (agent, interface). */
-  rows: readonly RawRow[];
-  onAddRow: (input: NewRawRow) => RawRow;
-  onUpdateRow: (id: string, patch: Partial<RawRow>) => void;
+  /** Rows already filtered to this (agent, interface), in insertion order. */
+  rows: readonly WatchRow[];
+  onAddRow: (input: NewWatchRow) => WatchRow;
+  onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
 }
-
-type Tab = "registers" | "raw";
 
 export function InterfacePanel({
   bridge,
@@ -43,16 +45,42 @@ export function InterfacePanel({
   onUpdateRow,
   onRemoveRow,
 }: InterfacePanelProps) {
-  const rawOnly = iface.map_name === null;
-  const [tab, setTab] = React.useState<Tab>(rawOnly ? "raw" : "registers");
-
+  const [pickerOpen, setPickerOpen] = React.useState(false);
   const snapshotQuery = useSnapshot(bridge, agentAddress, iface.name);
-  const registersQuery = useRegisters(bridge, agentAddress, iface.name, iface.map_name);
+  const registersQuery = useRegisters(
+    bridge,
+    agentAddress,
+    iface.name,
+    iface.map_name,
+    iface.register_count,
+  );
 
   const snapshot = snapshotQuery.data;
   const snapshotError = snapshotQuery.error instanceof Error ? snapshotQuery.error : null;
   const stale =
     snapshotQuery.dataUpdatedAt > 0 && Date.now() - snapshotQuery.dataUpdatedAt > SNAPSHOT_STALE_MS;
+
+  const registers = registersQuery.data?.registers ?? NO_REGISTERS;
+  const catalogError = registersQuery.error instanceof Error ? registersQuery.error : null;
+  // Named rows would flash as orphans if they rendered before the catalog they
+  // join against, so a mapped interface waits for it. Raw rows don't care.
+  const catalogPending = iface.map_name !== null && registersQuery.isLoading;
+  // An interface with no map has nothing to join against and never will, so a
+  // named row on it really is orphaned. A catalog that failed to load says
+  // nothing about any row — those rows keep working on their paths alone.
+  const catalogReady = iface.map_name === null || registersQuery.isSuccess;
+  const retryCatalog = registersQuery.refetch;
+
+  const openPicker = React.useCallback(() => setPickerOpen(true), []);
+  const addRegister = React.useCallback(
+    (reg: RegisterEntry) =>
+      onAddRow({ kind: "named", agent: agentAddress, interface: iface.name, path: reg.path }),
+    [onAddRow, agentAddress, iface.name],
+  );
+  const addRawRow = React.useCallback(
+    () => onAddRow(defaultRawRow(agentAddress, iface.name)),
+    [onAddRow, agentAddress, iface.name],
+  );
 
   return (
     <div className="rounded-lg border border-border bg-background/40">
@@ -92,118 +120,72 @@ export function InterfacePanel({
         {snapshotError && <p className="text-[11px] text-destructive">{snapshotError.message}</p>}
       </div>
 
-      <div className="border-t border-border px-3 py-3 space-y-3">
-        {rawOnly ? (
-          <p className="text-xs text-muted-foreground">
-            This interface has no register map, so there are no named registers to show. Use raw
-            access below, or add a <code>register_map</code> to the interface&apos;s config.
-          </p>
+      {/* The blurb + Add button, the table, and the dialog that feeds it. The
+          table starts empty; the catalog is only ever browsed through the
+          dialog. */}
+      <div className="border-t border-border px-3 py-3">
+        {catalogPending ? (
+          <p className="text-xs text-muted-foreground">Loading register map…</p>
         ) : (
-          <div className="flex items-center gap-1">
-            <TabButton active={tab === "registers"} onClick={() => setTab("registers")}>
-              Registers
-            </TabButton>
-            <TabButton active={tab === "raw"} onClick={() => setTab("raw")}>
-              Raw access
-            </TabButton>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">
+                Named values come from the extension&apos;s poll cache; a row&apos;s refresh button
+                reads from the device.
+              </p>
+              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={openPicker}>
+                <Plus className="h-3 w-3" />
+                Add
+              </Button>
+            </div>
+
+            {catalogError && (
+              <div
+                role="alert"
+                className="flex flex-wrap items-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1.5 text-xs text-destructive"
+              >
+                <span>
+                  Could not load the register map: {catalogError.message}. Rows below still read and
+                  write — only their details are missing.
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="ml-auto h-6 text-[11px]"
+                  onClick={() => void retryCatalog()}
+                  disabled={registersQuery.isFetching}
+                >
+                  Retry
+                </Button>
+              </div>
+            )}
+
+            <RegisterTable
+              bridge={bridge}
+              agentAddress={agentAddress}
+              interfaceName={iface.name}
+              interfacePollInterval={iface.poll_interval}
+              registers={registers}
+              rows={rows}
+              catalogReady={catalogReady}
+              snapshot={snapshot}
+              onUpdateRow={onUpdateRow}
+              onRemoveRow={onRemoveRow}
+              onAdd={openPicker}
+            />
+
+            <AddRegisterDialog
+              open={pickerOpen}
+              onOpenChange={setPickerOpen}
+              interfaceName={iface.name}
+              registers={registers}
+              onAdd={addRegister}
+              onAddRaw={addRawRow}
+            />
           </div>
-        )}
-
-        {tab === "registers" && !rawOnly && (
-          <RegistersTabBody
-            bridge={bridge}
-            agentAddress={agentAddress}
-            iface={iface}
-            registers={registersQuery.data?.registers ?? null}
-            isLoading={registersQuery.isLoading}
-            error={registersQuery.error instanceof Error ? registersQuery.error : null}
-            snapshot={snapshot}
-          />
-        )}
-
-        {tab === "raw" && (
-          <RawPanel
-            bridge={bridge}
-            agentAddress={agentAddress}
-            interfaceName={iface.name}
-            rows={rows}
-            onAddRow={onAddRow}
-            onUpdateRow={onUpdateRow}
-            onRemoveRow={onRemoveRow}
-          />
         )}
       </div>
     </div>
-  );
-}
-
-function RegistersTabBody({
-  bridge,
-  agentAddress,
-  iface,
-  registers,
-  isLoading,
-  error,
-  snapshot,
-}: {
-  bridge: BridgeTransport;
-  agentAddress: string;
-  iface: ModbusInterfaceEntry;
-  registers: React.ComponentProps<typeof RegisterTable>["registers"] | null;
-  isLoading: boolean;
-  error: Error | null;
-  snapshot: React.ComponentProps<typeof RegisterTable>["snapshot"];
-}) {
-  if (error) {
-    return (
-      <p className="text-xs text-destructive">Could not load the register map: {error.message}</p>
-    );
-  }
-  if (registers === null) {
-    return (
-      <p className="text-xs text-muted-foreground">
-        {isLoading ? "Loading register map…" : "No register map returned."}
-      </p>
-    );
-  }
-  if (registers.length === 0) {
-    return (
-      <p className="text-xs text-muted-foreground">
-        The register map <code>{iface.map_name}</code> has no registers.
-      </p>
-    );
-  }
-  return (
-    <RegisterTable
-      bridge={bridge}
-      agentAddress={agentAddress}
-      interfaceName={iface.name}
-      interfacePollInterval={iface.poll_interval}
-      registers={registers}
-      snapshot={snapshot}
-    />
-  );
-}
-
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <Button
-      size="sm"
-      variant={active ? "secondary" : "ghost"}
-      onClick={onClick}
-      aria-pressed={active}
-      className="h-7 px-3 text-xs"
-    >
-      {children}
-    </Button>
   );
 }
 
@@ -233,5 +215,5 @@ function ConnectionBadge({ connected, stale }: { connected: boolean; stale: bool
 }
 
 function Dot({ className }: { className: string }) {
-  return <span className={`inline-block h-1.5 w-1.5 rounded-full ${className}`} />;
+  return <span className={cn("inline-block h-1.5 w-1.5 rounded-full", className)} />;
 }

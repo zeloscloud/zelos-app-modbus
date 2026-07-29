@@ -19,6 +19,7 @@ import type { ExtensionEntry } from "@zeloscloud/app-extension-sdk";
 
 import {
   MIN_MODBUS_EXTENSION_VERSION,
+  MODBUS_ACTION_PREFIX,
   MODBUS_EXTENSION_INSTALL_IDS,
   REQUIRED_MODBUS_METHODS,
   modbusActionPath,
@@ -28,15 +29,26 @@ import {
 
 export type AgentStatusKind =
   | "ready"
+  /** Neither fan-out reported anything for this agent — not even a non-Modbus
+   *  extension or action. The host inserts an empty result for an agent it can't
+   *  reach, so this is "no answer", not "no extension". */
+  | "nothing-registered"
   | "extension-missing"
   | "extension-stopped"
-  /** Running, but `actions.list` is missing methods this app needs. */
+  /** Running, but not one `modbus/*` path is registered yet — the extension is
+   *  still coming up. A moment after Start, every install looks like this. */
+  | "extension-starting"
+  /** Running, some `modbus/*` paths registered, and one this app needs is
+   *  missing. That really is an old extension. */
   | "extension-outdated"
   /** Running with the full action set, and `list_interfaces` returned zero. */
   | "no-interfaces"
   /** Extension is up + actions registered, but the discovery RPC hasn't
    *  resolved yet. The UI renders a placeholder header while this loads. */
-  | "discovering-interfaces";
+  | "discovering-interfaces"
+  /** `list_interfaces` itself failed. Distinct from "still loading", which never
+   *  ends on its own. */
+  | "discovery-failed";
 
 export interface AgentStatus {
   agent: string;
@@ -48,6 +60,8 @@ export interface AgentStatus {
   /** Present only when `kind === "extension-outdated"` — the bare method names
    *  whose action paths were absent. */
   missingMethods?: readonly string[];
+  /** Present only when `kind === "discovery-failed"`. */
+  error?: string;
 }
 
 export type TopLevelDisabledReason = "not-live" | "no-agents-connected";
@@ -67,6 +81,9 @@ export interface DiscoverInputs {
    *  hook is willing to query). `undefined` means "not yet fetched"; `[]` means
    *  "fetched, zero interfaces configured". */
   interfacesByAgent: Record<string, ModbusInterfaceEntry[] | undefined> | null;
+  /** Message per agent whose `list_interfaces` failed, so a persistent failure
+   *  reads as failed rather than as forever-loading. */
+  interfaceErrorsByAgent?: Record<string, string | undefined> | null;
 }
 
 /** Top-level discovery: builds the agent list + status, or returns a disabled
@@ -93,6 +110,7 @@ export function discoverModbus(input: DiscoverInputs): ModbusDiscovery {
         input.extensionsByAgent?.[agent] ?? [],
         input.actionsByAgent?.[agent] ?? [],
         input.interfacesByAgent?.[agent],
+        input.interfaceErrorsByAgent?.[agent],
       ),
     );
   return { kind: "ready", agents };
@@ -106,7 +124,16 @@ export function resolveAgentStatus(
   /** Interfaces returned by `modbus/list_interfaces` on this agent, or
    *  `undefined` if the RPC hasn't completed yet. */
   interfaces: readonly ModbusInterfaceEntry[] | undefined,
+  /** Why `list_interfaces` failed, if it did. */
+  interfaceError?: string | undefined,
 ): AgentStatus {
+  // Both fan-outs empty means the agent said nothing at all, which is what the
+  // host reports for an agent it couldn't reach. Claiming the extension is
+  // missing (and telling the user to install it) would be a guess.
+  if (extensions.length === 0 && actionPaths.length === 0) {
+    return { agent, kind: "nothing-registered" };
+  }
+
   // Match any known install ID (marketplace canonical OR `local.*` aliases the
   // install-local CLI assigns). Different install methods, same extension.
   const ext = extensions.find((e) => MODBUS_EXTENSION_INSTALL_IDS.has(e.id));
@@ -117,10 +144,17 @@ export function resolveAgentStatus(
     return { agent, kind: "extension-stopped", extension: ext };
   }
 
-  // Confirm every required action path is registered. A gap means the extension
-  // predates the actions this app drives (or didn't finish registering) — not
-  // that the interfaces are misconfigured.
+  // Not a single Modbus action yet: the extension process is up but hasn't
+  // registered anything. Every Start passes through this state for a moment, so
+  // it must not read as "your extension is too old".
   const actionSet = new Set(actionPaths);
+  const hasAnyModbusAction = actionPaths.some((path) => path.startsWith(MODBUS_ACTION_PREFIX));
+  if (!hasAnyModbusAction) {
+    return { agent, kind: "extension-starting", extension: ext };
+  }
+
+  // Some paths are registered but one this app drives is absent: the extension
+  // really does predate it.
   const missing: string[] = [];
   for (const method of REQUIRED_MODBUS_METHODS) {
     if (!actionSet.has(modbusActionPath(method))) missing.push(method);
@@ -130,6 +164,9 @@ export function resolveAgentStatus(
   }
 
   // Action set is good. Now we need the interface list.
+  if (interfaceError !== undefined) {
+    return { agent, kind: "discovery-failed", extension: ext, error: interfaceError };
+  }
   if (interfaces === undefined) {
     return { agent, kind: "discovering-interfaces", extension: ext };
   }
@@ -140,30 +177,14 @@ export function resolveAgentStatus(
   return { agent, kind: "ready", extension: ext, interfaces };
 }
 
-/** Short text label for the agent's status, used in chips + tooltips. */
-export function statusLabel(status: AgentStatus): string {
-  switch (status.kind) {
-    case "ready": {
-      const n = status.interfaces?.length ?? 0;
-      return `ready (${n} interface${n === 1 ? "" : "s"})`;
-    }
-    case "extension-missing":
-      return "Modbus extension not installed";
-    case "extension-stopped":
-      return `Modbus extension ${status.extension?.state ?? "stopped"}`;
-    case "extension-outdated":
-      return `missing actions: ${status.missingMethods?.join(", ") ?? "unknown"}`;
-    case "no-interfaces":
-      return "no interfaces configured";
-    case "discovering-interfaces":
-      return "discovering interfaces…";
-  }
-}
-
 /** One-line fix-it copy per failing status. `null` for healthy/in-flight
  *  states, which need no remediation. */
 export function remediation(status: AgentStatus): string | null {
   switch (status.kind) {
+    case "nothing-registered":
+      return "No extensions or actions visible on this agent — it may be unreachable.";
+    case "discovery-failed":
+      return `Could not list this agent's interfaces${status.error ? `: ${status.error}` : ""}. Check the extension's logs and its interface config, then Refresh.`;
     case "extension-missing":
       return "Install the Modbus extension from the marketplace, or run `zelos extensions install-local <path-to-zelos-extension-modbus>` and Refresh.";
     case "extension-stopped":
@@ -172,7 +193,9 @@ export function remediation(status: AgentStatus): string | null {
       return `Update the Modbus extension to ${MIN_MODBUS_EXTENSION_VERSION}+ — this app needs actions the installed version does not register.`;
     case "no-interfaces":
       return "The extension is running but has no interfaces configured. Add one in the extension's config, then Refresh.";
+    // Nothing to fix in either: one is healthy, two are in flight.
     case "ready":
+    case "extension-starting":
     case "discovering-interfaces":
       return null;
   }
