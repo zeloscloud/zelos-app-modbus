@@ -8,10 +8,10 @@ import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { InterfacePanel } from "../InterfacePanel";
+import { DevicePanel } from "../DevicePanel";
 import { useWatchRows } from "@/hooks/use-watch-rows";
-import { listInterfaces } from "@/lib/modbus-bridge";
-import type { ModbusInterfaceEntry } from "@/lib/types";
+import { listDevices } from "@/lib/modbus-bridge";
+import type { ModbusDeviceEntry, ModbusSnapshot } from "@/lib/types";
 import { loadRows } from "@/lib/watch-store";
 import { installedMockBridge } from "@/mocks/mock-bridge";
 
@@ -35,14 +35,14 @@ function makeHost(): BridgeTransport {
 }
 
 /** Mirrors App's ownership of the row list. */
-function Harness({ bridge, iface }: { bridge: BridgeTransport; iface: ModbusInterfaceEntry }) {
+function Harness({ bridge, device }: { bridge: BridgeTransport; device: ModbusDeviceEntry }) {
   const { rows, addRow, updateRow, removeRow } = useWatchRows();
   return (
-    <InterfacePanel
+    <DevicePanel
       bridge={bridge}
       agentAddress={AGENT}
-      iface={iface}
-      rows={rows.filter((r) => r.interface === iface.name)}
+      device={device}
+      rows={rows.filter((r) => r.device === device.name)}
       onAddRow={addRow}
       onUpdateRow={updateRow}
       onRemoveRow={removeRow}
@@ -53,7 +53,11 @@ function Harness({ bridge, iface }: { bridge: BridgeTransport; iface: ModbusInte
 /** Wraps a bridge so a test can watch — or break — individual actions. */
 function intercept(
   bridge: BridgeTransport,
-  hooks: { calls?: string[]; failCatalogUntil?: { count: number } } = {},
+  hooks: {
+    calls?: string[];
+    failCatalogUntil?: { count: number };
+    snapshot?: Partial<ModbusSnapshot>;
+  } = {},
 ): BridgeTransport {
   const inner = bridge.invoke.bind(bridge) as (m: string, p?: unknown) => Promise<unknown>;
   return {
@@ -61,39 +65,42 @@ function intercept(
     invoke: async (method: string, params?: unknown) => {
       const action = (params as { action?: string } | undefined)?.action ?? method;
       hooks.calls?.push(action);
-      if (action === "modbus/list_registers" && (hooks.failCatalogUntil?.count ?? 0) > 0) {
+      if (action === "Modbus/list_registers" && (hooks.failCatalogUntil?.count ?? 0) > 0) {
         if (hooks.failCatalogUntil) hooks.failCatalogUntil.count -= 1;
         throw new Error("catalog unavailable");
       }
-      return await inner(method, params);
+      const res = await inner(method, params);
+      if (action !== "Modbus/get_snapshot" || !hooks.snapshot) return res;
+      const done = res as { result: ModbusSnapshot };
+      return { ...done, result: { ...done.result, ...hooks.snapshot } };
     },
   } as unknown as BridgeTransport;
 }
 
-/** `mapped: false` picks the interface with no register map — the raw-only path. */
+/** `mapped: false` picks the device with no register map — the raw-only path. */
 async function renderPanel({
   mapped = true,
   wrap,
 }: { mapped?: boolean; wrap?: (bridge: BridgeTransport) => BridgeTransport } = {}) {
   const host = makeHost();
   const bridge = wrap ? wrap(host) : host;
-  const interfaces = (await listInterfaces(host, AGENT)).interfaces;
-  const iface = interfaces.find((i) => (mapped ? i.map_name !== null : i.map_name === null));
-  if (!iface) throw new Error(`mock host has no ${mapped ? "mapped" : "raw-only"} interface`);
+  const devices = (await listDevices(host, AGENT)).devices;
+  const device = devices.find((d) => (mapped ? d.map_name !== null : d.map_name === null));
+  if (!device) throw new Error(`mock host has no ${mapped ? "mapped" : "raw-only"} device`);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>
-      <Harness bridge={bridge} iface={iface} />
+      <Harness bridge={bridge} device={device} />
     </QueryClientProvider>,
   );
-  /** Re-render as if `list_interfaces` had reported a changed interface. */
-  const update = (patch: Partial<ModbusInterfaceEntry>) =>
+  /** Re-render as if `list_devices` had reported a changed device. */
+  const update = (patch: Partial<ModbusDeviceEntry>) =>
     view.rerender(
       <QueryClientProvider client={client}>
-        <Harness bridge={bridge} iface={{ ...iface, ...patch }} />
+        <Harness bridge={bridge} device={{ ...device, ...patch }} />
       </QueryClientProvider>,
     );
-  return { iface, update };
+  return { device, update };
 }
 
 /** Register options in the dialog are buttons wrapping the register name. */
@@ -112,16 +119,16 @@ async function dialogClosed(): Promise<void> {
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 }
 
-describe("InterfacePanel rows section", () => {
+describe("DevicePanel rows section", () => {
   it("adds a register through the dialog, then deletes it", async () => {
-    const { iface } = await renderPanel();
+    const { device } = await renderPanel();
 
     // The catalog loads, but the table stays empty until the user opts in.
     expect(await screen.findByText(/No rows yet/)).toBeInTheDocument();
     expect(screen.queryByText("power/total")).not.toBeInTheDocument();
 
     const dialog = await openDialog();
-    expect(dialog).toHaveTextContent(iface.name);
+    expect(dialog).toHaveTextContent(device.name);
     fireEvent.click(dialogOption("total"));
 
     // Adding closes the dialog — the new row is what the user wants next.
@@ -130,7 +137,7 @@ describe("InterfacePanel rows section", () => {
     // The row is in the table, joined to catalog metadata, and persisted.
     const row = (await screen.findByText("power/total")).closest("tr");
     expect(row).not.toBeNull();
-    expect(row).toHaveTextContent("12 (0x000c)");
+    expect(row).toHaveTextContent("13 (0x000d)");
     expect(loadRows().map((r) => (r.kind === "named" ? r.path : "raw"))).toEqual(["power/total"]);
 
     fireEvent.click(screen.getByRole("button", { name: "Remove power/total from the table" }));
@@ -158,13 +165,18 @@ describe("InterfacePanel rows section", () => {
     expect(loadRows().map((r) => r.draft)).toEqual(["10", "20"]);
   });
 
-  it("restores rows saved before raw rows existed, flagging a path the map lost", async () => {
-    // No `kind` field: exactly what the previous version persisted.
+  it("restores saved rows, flagging a path the map lost", async () => {
     window.localStorage.setItem(
-      "zelos-app-modbus.watch-rows.v1",
+      "zelos-app-modbus.watch-rows.v2",
       JSON.stringify([
-        { id: "a", agent: AGENT, interface: "meter", path: "power/total" },
-        { id: "b", agent: AGENT, interface: "meter", path: "retired/register" },
+        { id: "a", agent: AGENT, device: "meter_panel/unit1", kind: "named", path: "power/total" },
+        {
+          id: "b",
+          agent: AGENT,
+          device: "meter_panel/unit1",
+          kind: "named",
+          path: "retired/register",
+        },
       ]),
     );
     await renderPanel();
@@ -204,10 +216,10 @@ describe("InterfacePanel rows section", () => {
 
     // It arrives on the defaults, ready to edit.
     const address = await screen.findByLabelText("Raw address");
-    expect(address).toHaveValue("0");
+    expect(address).toHaveValue("1");
     expect(loadRows()[0]).toMatchObject({
       kind: "raw",
-      address: "0",
+      address: "1",
       table: "holding",
       datatype: "uint16",
     });
@@ -230,9 +242,9 @@ describe("InterfacePanel rows section", () => {
     expect(loadRows()).toEqual([]);
   });
 
-  it("serves an interface with no register map through the same section", async () => {
-    const { iface } = await renderPanel({ mapped: false });
-    expect(iface.map_name).toBeNull();
+  it("serves a device with no register map through the same section", async () => {
+    const { device } = await renderPanel({ mapped: false });
+    expect(device.map_name).toBeNull();
 
     expect(await screen.findByText(/No rows yet/)).toBeInTheDocument();
     expect(screen.getByText("raw only")).toBeInTheDocument();
@@ -245,14 +257,36 @@ describe("InterfacePanel rows section", () => {
     expect(await screen.findByLabelText("Raw address")).toBeInTheDocument();
     expect(loadRows()).toHaveLength(1);
   });
+
+  it("flags a demoted, overloaded device from the snapshot", async () => {
+    const snapshot = {
+      demoted: true,
+      retry_in_s: 19.2,
+      requested_rate: 1,
+      achieved_rate: 2.5,
+      overload_pct: 150,
+      failed_reads: 3,
+    };
+    await renderPanel({ wrap: (b) => intercept(b, { snapshot }) });
+
+    expect(await screen.findByText("demoted, retry in 20s")).toBeInTheDocument();
+    expect(screen.getByText("rate 1s (achieved 2.5s)")).toHaveClass("text-amber-600");
+    expect(screen.getByText("failed 3")).toHaveClass("text-amber-600");
+  });
+
+  it("shows disconnected instead of a rate while the link is down", async () => {
+    const snapshot = { connected: false, requested_rate: 1, achieved_rate: null };
+    await renderPanel({ wrap: (b) => intercept(b, { snapshot }) });
+    expect(await screen.findByText("rate 1s (disconnected)")).toBeInTheDocument();
+  });
 });
 
-describe("InterfacePanel when the catalog can't be loaded", () => {
+describe("DevicePanel when the catalog can't be loaded", () => {
   it("keeps the rows working instead of calling them orphans", async () => {
     window.localStorage.setItem(
-      "zelos-app-modbus.watch-rows.v1",
+      "zelos-app-modbus.watch-rows.v2",
       JSON.stringify([
-        { id: "a", agent: AGENT, interface: "meter", kind: "named", path: "power/total" },
+        { id: "a", agent: AGENT, device: "meter_panel/unit1", kind: "named", path: "power/total" },
       ]),
     );
     await renderPanel({ wrap: (b) => intercept(b, { failCatalogUntil: { count: 99 } }) });
@@ -268,9 +302,9 @@ describe("InterfacePanel when the catalog can't be loaded", () => {
 
   it("retries the catalog on demand, and joins the rows once it lands", async () => {
     window.localStorage.setItem(
-      "zelos-app-modbus.watch-rows.v1",
+      "zelos-app-modbus.watch-rows.v2",
       JSON.stringify([
-        { id: "a", agent: AGENT, interface: "meter", kind: "named", path: "power/total" },
+        { id: "a", agent: AGENT, device: "meter_panel/unit1", kind: "named", path: "power/total" },
       ]),
     );
     // Fails once, then works.
@@ -280,15 +314,15 @@ describe("InterfacePanel when the catalog can't be loaded", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     // The catalog arrives: the row picks up its address and the banner goes.
-    expect(await screen.findByText("12 (0x000c)")).toBeInTheDocument();
+    expect(await screen.findByText("13 (0x000d)")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("refetches the catalog when the interface's register count changes", async () => {
+  it("refetches the catalog when the device's register count changes", async () => {
     const calls: string[] = [];
     const { update } = await renderPanel({ wrap: (b) => intercept(b, { calls }) });
     await screen.findByText(/No rows yet/);
-    const before = calls.filter((a) => a === "modbus/list_registers").length;
+    const before = calls.filter((a) => a === "Modbus/list_registers").length;
     expect(before).toBeGreaterThan(0);
 
     // A restart can swap a map's contents without renaming it; the count is the
@@ -296,7 +330,7 @@ describe("InterfacePanel when the catalog can't be loaded", () => {
     update({ register_count: 99 });
 
     await waitFor(() =>
-      expect(calls.filter((a) => a === "modbus/list_registers").length).toBe(before + 1),
+      expect(calls.filter((a) => a === "Modbus/list_registers").length).toBe(before + 1),
     );
   });
 });

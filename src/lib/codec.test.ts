@@ -68,23 +68,11 @@ describe("decodeValue (ported vectors)", () => {
 
   it("applies the scale after decoding", () => {
     expect(decodeValue([1000], "uint16", 0.1)).toBe(100);
-  });
-
-  it("TRUNCATES scaled integer results (the extension quirk we mirror)", () => {
-    // Python: int(1005 * 0.1) == 100. A raw read must not report 100.5 while
-    // read_named_register reports 100 for the same register.
-    expect(decodeValue([1005], "uint16", 0.1)).toBe(100);
-    expect(decodeValue([1099], "uint16", 0.1)).toBe(109);
-  });
-
-  it("truncates toward zero for negative scaled integers", () => {
-    // int16 65531 == -5; int(-5 * 0.1) == 0 in Python (not -1).
-    expect(decodeValue([65531], "int16", 0.1)).toBe(0);
-    expect(decodeValue([65436], "int16", 0.1)).toBe(-10); // -100 * 0.1
+    // A 1/n scale divides, as client.py does: 3 * 0.1 is 0.30000000000000004.
+    expect(decodeValue([3], "uint16", 0.1)).toBe(0.3);
   });
 
   it("keeps the fraction for float datatypes", () => {
-    expect(decodeValue([0x0000, 0x0064], "uint32", 0.1)).toBe(10); // int(100 * 0.1)
     expect(decodeValue(encodeValue(10.05, "float32"), "float32") as number).toBeCloseTo(10.05, 5);
   });
 
@@ -128,9 +116,9 @@ describe("encodeValue (ported vectors)", () => {
     }
   });
 
-  it("truncates toward zero before packing (Python int())", () => {
-    expect(encodeValue(5.9, "uint16")).toEqual([5]);
-    expect(encodeValue(-5.9, "int16")).toEqual([65531]); // -5
+  it("rounds to nearest before packing", () => {
+    expect(encodeValue(5.9, "uint16")).toEqual([6]);
+    expect(encodeValue(-5.9, "int16")).toEqual([65530]); // -6
     expect(encodeValue(-0.4, "int16")).toEqual([0]);
   });
 
@@ -147,11 +135,9 @@ describe("encodeValue (ported vectors)", () => {
     expect(encodeValue(3.14, "float32")).toEqual([0x4048, 0xf5c3]);
   });
 
-  it("inherits the float-division tick loss of int(value / scale)", () => {
-    // 23.4 / 0.1 is 233.99999999999997 in IEEE-754, so Python's int() yields
-    // 233 — not 234. Mirrored so a raw write matches write_named_register.
-    expect(encodeValue(23.4, "int16", 0.1)).toEqual([233]);
-    expect(encodeValue(23.5, "int16", 0.1)).toEqual([235]);
+  it("rounds away the float-division error of value / scale", () => {
+    // 23.4 / 0.1 is 233.99999999999997 in IEEE-754.
+    expect(encodeValue(23.4, "int16", 0.1)).toEqual([234]);
   });
 });
 
@@ -164,47 +150,60 @@ describe("reorderWords (ported vectors)", () => {
     }
   });
 
-  it("big keeps the original order", () => {
-    expect(reorderWords([0xabcd, 0xef01], "big")).toEqual([0xabcd, 0xef01]);
-  });
+  // Same vectors as the extension's test_known_vectors. A = most significant
+  // byte: big ABCD, little DCBA, big_swap CDAB, little_swap BADC.
+  const VECTORS: Array<
+    [ModbusDatatype, number | bigint, number, Partial<Record<ByteOrder, number[]>>]
+  > = [
+    [
+      "float32",
+      1.0,
+      1,
+      {
+        big: [0x3f80, 0x0000],
+        little: [0x0000, 0x803f],
+        big_swap: [0x0000, 0x3f80],
+        little_swap: [0x803f, 0x0000],
+      },
+    ],
+    [
+      "uint32",
+      0x11223344,
+      1,
+      {
+        big: [0x1122, 0x3344],
+        little: [0x4433, 0x2211],
+        big_swap: [0x3344, 0x1122],
+        little_swap: [0x2211, 0x4433],
+      },
+    ],
+    [
+      "uint64",
+      0x1122334455667788n,
+      1,
+      {
+        big: [0x1122, 0x3344, 0x5566, 0x7788],
+        little: [0x8877, 0x6655, 0x4433, 0x2211],
+        big_swap: [0x7788, 0x5566, 0x3344, 0x1122],
+        little_swap: [0x2211, 0x4433, 0x6655, 0x8877],
+      },
+    ],
+    // A scaled integer decodes to a fraction and encodes rounded to nearest.
+    ["int32", -123.4, 0.1, { big: [0xffff, 0xfb2e], little: [0x2efb, 0xffff] }],
+    ["uint16", 123.4, 0.1, { big: [1234], little: [1234] }],
+  ];
 
-  it("little reverses the words", () => {
-    expect(reorderWords([0xabcd, 0xef01], "little")).toEqual([0xef01, 0xabcd]);
-  });
-
-  it("big_swap swaps the word pair", () => {
-    expect(reorderWords([0xabcd, 0xef01], "big_swap")).toEqual([0xef01, 0xabcd]);
-  });
-
-  it("little_swap on 32-bit is BA DC", () => {
-    expect(reorderWords([0xabcd, 0xef01], "little_swap")).toEqual([0xef01, 0xabcd]);
-  });
-
-  it("little reverses all four words of a 64-bit value", () => {
-    expect(reorderWords([0x0001, 0x0002, 0x0003, 0x0004], "little")).toEqual([
-      0x0004, 0x0003, 0x0002, 0x0001,
-    ]);
-  });
-
-  it("big_swap on 64-bit swaps within each pair", () => {
-    expect(reorderWords([0x0001, 0x0002, 0x0003, 0x0004], "big_swap")).toEqual([
-      0x0002, 0x0001, 0x0004, 0x0003,
-    ]);
-  });
-
-  it("little_swap on 64-bit is a full reverse", () => {
-    expect(reorderWords([0x0001, 0x0002, 0x0003, 0x0004], "little_swap")).toEqual([
-      0x0004, 0x0003, 0x0002, 0x0001,
-    ]);
-  });
-
-  it("leaves undefined lengths (3 words) alone for the swap orders", () => {
-    // The Python permutations are only defined for 2 and 4 words; anything else
-    // falls through unchanged (`little` still reverses, since it is length-free).
-    expect(reorderWords([1, 2, 3], "big_swap")).toEqual([1, 2, 3]);
-    expect(reorderWords([1, 2, 3], "little_swap")).toEqual([1, 2, 3]);
-    expect(reorderWords([1, 2, 3], "little")).toEqual([3, 2, 1]);
-  });
+  it.each(VECTORS)(
+    "%s %s ×%s encodes and decodes the known vectors",
+    (datatype, value, scale, words) => {
+      for (const [order, raw] of Object.entries(words) as Array<[ByteOrder, number[]]>) {
+        expect(encodeValue(value, datatype, scale, order)).toEqual(raw);
+        const decoded = decodeValue(raw, datatype, scale, order);
+        if (typeof value === "bigint") expect(decoded).toBe(value);
+        else expect(decoded as number).toBeCloseTo(value, 6);
+      }
+    },
+  );
 
   it("decodes float32 with a word-swapped order", () => {
     expect(decodeValue([0xf5c3, 0x4048], "float32", 1, "big_swap") as number).toBeCloseTo(3.14, 2);
@@ -235,7 +234,6 @@ describe("64-bit integers", () => {
   });
 
   it("falls back to a scaled number when a scale is set", () => {
-    // Matches Python's int(raw * scale) for values a double can hold.
     expect(decodeValue([0x0000, 0x0000, 0x0000, 0x2710], "uint64", 0.1)).toBe(1000);
   });
 
@@ -443,15 +441,20 @@ const ADDRESS_CASES: Array<[string, number]> = [
 
 describe("parseAddress", () => {
   it.each(ADDRESS_CASES)("parses %j → %s", (input, expected) => {
-    expect(parseAddress(input)).toBe(expected);
+    expect(parseAddress(input, 0)).toBe(expected);
   });
 
   it.each(["", "  ", "-1", "abc", "0x", "0xzz", "1.5", "1e3", "65536", "0x10000", "100 200"])(
     "rejects %j",
     (input) => {
-      expect(parseAddress(input)).toBeNull();
+      expect(parseAddress(input, 0)).toBeNull();
     },
   );
+
+  it("shifts the valid range by the address base", () => {
+    expect(parseAddress("0", 1)).toBeNull();
+    expect(parseAddress("65536", 1)).toBe(65536);
+  });
 });
 
 describe("table predicates", () => {
@@ -508,11 +511,11 @@ describe("parseWriteDraft", () => {
     expect(parseWriteDraft("5000", "int16", 0.1).error).toMatch(/out of range/);
   });
 
-  it("refuses a fraction an integer register would silently truncate", () => {
+  it("refuses a fraction an integer register would silently round", () => {
     const { value, error } = parseWriteDraft("1.9", "uint16", 1);
     expect(value).toBeNull();
-    // Naming the value that WOULD be written is the point: 1.9 becomes 1.
-    expect(error).toBe("1.9 is not a whole uint16 step — nearest writable value is 1");
+    // Naming the value that WOULD be written is the point: 1.9 becomes 2.
+    expect(error).toBe("1.9 is not a whole uint16 step; nearest writable value is 2");
     expect(parseWriteDraft("-2.5", "int16", 1).error).toMatch(/nearest writable value is -2/);
   });
 
@@ -616,7 +619,6 @@ describe("register-map shaped cases", () => {
   it("int16 with scale 0.1 behaves like the demo temperature register", () => {
     // status/temperature: int16, scale 0.1, °C. 23.5 °C → raw 235.
     expect(encodeValue(23.5, "int16", 0.1)).toEqual([235]);
-    // Decode truncates the scaled integer — 235 → int(23.5) → 23.
-    expect(decodeValue([235], "int16", 0.1)).toBe(23);
+    expect(decodeValue([235], "int16", 0.1)).toBe(23.5);
   });
 });

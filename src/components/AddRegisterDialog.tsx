@@ -23,29 +23,32 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { formatAddress } from "@/lib/codec";
-import type { RegisterEntry } from "@/lib/types";
+import type { AddressBase, RegisterEntry } from "@/lib/types";
 
 export interface AddRegisterDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Implicit from whichever interface section opened the dialog — no in-dialog
-   *  picker for the agent or the interface. */
-  interfaceName: string;
-  /** The interface's catalog, from `list_registers`. Empty for a raw-only
-   *  interface, which can still add raw rows. */
+  /** Implicit from whichever device section opened the dialog — no in-dialog
+   *  picker for the agent or the device. */
+  deviceName: string;
+  /** Where a new raw row starts. */
+  addressBase: AddressBase;
+  /** The device's catalog, from `list_registers`. Empty for a raw-only
+   *  device, which can still add raw rows. */
   registers: readonly RegisterEntry[];
   onAdd: (register: RegisterEntry) => void;
   /** Appends an arbitrary-address row, to be edited inline in the table. */
   onAddRaw: () => void;
 }
 
-/** Memoized: while it is open, the interface behind it keeps re-rendering at
+/** Memoized: while it is open, the device behind it keeps re-rendering at
  *  1 Hz, and rebuilding a whole catalog of options for each snapshot is pure
  *  waste. Every prop it takes is stable. */
 export const AddRegisterDialog = React.memo(function AddRegisterDialog({
   open,
   onOpenChange,
-  interfaceName,
+  deviceName,
+  addressBase,
   registers,
   onAdd,
   onAddRaw,
@@ -70,7 +73,7 @@ export const AddRegisterDialog = React.memo(function AddRegisterDialog({
           <DialogTitle>Add a row</DialogTitle>
           <DialogDescription>
             {registers.length} register{registers.length === 1 ? "" : "s"} in{" "}
-            <code className="font-mono">{interfaceName}</code>&apos;s map.
+            <code className="font-mono">{deviceName}</code>&apos;s map.
           </DialogDescription>
         </DialogHeader>
 
@@ -82,7 +85,7 @@ export const AddRegisterDialog = React.memo(function AddRegisterDialog({
             onAddRaw();
             onOpenChange(false);
           }}
-          title="Append an arbitrary-address row (holding, uint16, address 0) and edit it in the table"
+          title={`Append an arbitrary-address row (holding, uint16, address ${addressBase}) and edit it in the table`}
         >
           <Plus className="h-3 w-3" />
           Add raw row
@@ -99,7 +102,7 @@ export const AddRegisterDialog = React.memo(function AddRegisterDialog({
         <div className="-mx-1 flex-1 overflow-y-auto px-1">
           {registers.length === 0 ? (
             <p className="py-6 text-center text-xs text-muted-foreground">
-              This interface has no register map, so there are no named registers to add. Use{" "}
+              This device has no register map, so there are no named registers to add. Use{" "}
               <strong>Add raw row</strong>.
             </p>
           ) : matchCount === 0 ? (

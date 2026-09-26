@@ -8,11 +8,16 @@
  *  against hardware and writes persist into later snapshots and reads. The fake
  *  register map is modeled on the extension's `demo/power_meter.json`.
  *
- *  Action paths land as `modbus/<method>` to match the real agent — a single
- *  global namespace with the target selected by the `interface` parameter. All
- *  wire fields are snake_case (mirroring the Python extension's idiom), and
- *  results come back as status `"done"`, with failures expressed in-band as
- *  `{error, success: false}` exactly as the extension does. */
+ *  Memory is keyed by WIRE address. Everything the actions take or report is in
+ *  the device's `address_base`, converted exactly as the extension does:
+ *  `wire = address - base`. unit1 and the probe use base 1, unit2 base 0.
+ *
+ *  Action paths land as `Modbus/<method>` to match the real agent — a single
+ *  global namespace with the target selected by the `device` parameter
+ *  (`<connection>/<device>`). All wire fields are snake_case (mirroring the
+ *  Python extension's idiom), and results come back as status `"done"`, with
+ *  failures expressed in-band as `{error, success: false}` exactly as the
+ *  extension does. */
 
 import type { MockBridge } from "@zeloscloud/app-extension-sdk";
 
@@ -22,16 +27,19 @@ import {
   encodeValue,
   isBitTable,
   isRegisterTableType,
+  maxAddress,
   wordCount,
 } from "@/lib/codec";
 import {
   MODBUS_EXTENSION_ID,
+  MODBUS_ACTION_PREFIX,
   MODBUS_METHODS,
   REQUIRED_MODBUS_METHODS,
   modbusActionPath,
+  type AddressBase,
   type ByteOrder,
   type ModbusDatatype,
-  type ModbusInterfaceEntry,
+  type ModbusDeviceEntry,
   type RegisterEntry,
   type RegisterTableType,
 } from "@/lib/types";
@@ -41,7 +49,7 @@ export type MockScenario =
   | "extension-missing"
   | "extension-stopped"
   | "extension-outdated"
-  | "no-interfaces"
+  | "no-devices"
   | "multi-agent";
 
 export interface MockHostOptions {
@@ -58,22 +66,25 @@ const TICK_MS = 1_000;
  *  blink past it. */
 export const STARTING_ACTIONS_MS = 6_000;
 
-/** Holding address of `status/spare_sensor`, the register that reads NaN. */
+/** Wire holding address of `status/spare_sensor`, the register that reads NaN. */
 const NAN_ADDRESS = 22;
 
-/** Action set advertised by `actions.list`: the current extension, a 0.1.4-era
- *  extension (no list_interfaces / get_snapshot / list_registers), or nothing. */
+/** Action set advertised by `actions.list`: the current extension, a 0.1.x
+ *  extension (lowercase `modbus/` namespace, per-interface actions), or nothing. */
 type ActionSet = "full" | "legacy" | "none";
 
-const LEGACY_ACTIONS: string[] = [
-  MODBUS_METHODS.getStatus,
-  MODBUS_METHODS.readRegister,
-  MODBUS_METHODS.writeSingleRegister,
-  MODBUS_METHODS.writeRegisters,
-  MODBUS_METHODS.writeCoil,
-  MODBUS_METHODS.readNamedRegister,
-  MODBUS_METHODS.writeNamedRegister,
-  "list_writable_registers",
+const LEGACY_ACTION_PATHS: string[] = [
+  "modbus/list_interfaces",
+  "modbus/get_status",
+  "modbus/get_snapshot",
+  "modbus/list_registers",
+  "modbus/read_register",
+  "modbus/write_single_register",
+  "modbus/write_registers",
+  "modbus/write_coil",
+  "modbus/read_named_register",
+  "modbus/write_named_register",
+  "modbus/list_writable_registers",
 ];
 
 // ─── Fake register map (power_meter shaped) ─────────────────────────────────
@@ -81,6 +92,7 @@ const LEGACY_ACTIONS: string[] = [
 interface RegisterDef {
   event: string;
   name: string;
+  /** Wire address; `list_registers` reports it in the device's base. */
   address: number;
   type?: RegisterTableType;
   datatype?: ModbusDatatype;
@@ -88,7 +100,8 @@ interface RegisterDef {
   scale?: number;
   byte_order?: ByteOrder;
   description?: string;
-  poll_interval?: number | null;
+  /** Seconds; unset polls at the meter's default (1 s), `0` never polls. */
+  rate?: number;
   /** Seed physical value written into device memory at boot. */
   seed?: number | boolean;
   /** Measurement registers get re-seeded on every tick; config ones don't, so
@@ -161,13 +174,22 @@ const REGISTER_DEFS: RegisterDef[] = [
     description: "Latched fault relay — clear it by writing OFF",
     seed: false,
   },
-  { event: "inputs", name: "firmware_version", address: 0, type: "input", seed: 0x0104 },
+  // Static identity: the slow (60 s) poll tier.
+  {
+    event: "inputs",
+    name: "firmware_version",
+    address: 0,
+    type: "input",
+    rate: 60,
+    seed: 0x0104,
+  },
   {
     event: "inputs",
     name: "serial_number",
     address: 1,
     type: "input",
     datatype: "uint32",
+    rate: 60,
     seed: 220_417,
   },
   { event: "digital_inputs", name: "door_open", address: 0, type: "discrete_input", seed: false },
@@ -201,7 +223,7 @@ const REGISTER_DEFS: RegisterDef[] = [
     address: 104,
     datatype: "uint32",
     description: "Write any value to clear the energy counter; never polled",
-    poll_interval: 0,
+    rate: 0,
     seed: 0,
   },
   {
@@ -238,13 +260,13 @@ function phase(
   }));
 }
 
-function toEntry(def: RegisterDef): RegisterEntry {
+function toEntry(def: RegisterDef, base: AddressBase): RegisterEntry {
   const type = def.type ?? "holding";
   return {
     name: def.name,
     event: def.event,
     path: `${def.event}/${def.name}`,
-    address: def.address,
+    address: def.address + base,
     type,
     datatype: def.datatype ?? (isBitTable(type) ? "bool" : "uint16"),
     unit: def.unit ?? "",
@@ -254,7 +276,7 @@ function toEntry(def: RegisterDef): RegisterEntry {
     // and the extension's Register dataclass forces that too.
     writable: type !== "input" && type !== "discrete_input",
     byte_order: def.byte_order ?? "big",
-    poll_interval: def.poll_interval ?? null,
+    rate: def.rate ?? 1,
   };
 }
 
@@ -267,8 +289,8 @@ interface Memory {
   discrete_input: Map<number, boolean>;
 }
 
-interface SimInterface {
-  entry: ModbusInterfaceEntry;
+interface SimDevice {
+  entry: ModbusDeviceEntry;
   defs: RegisterDef[];
   registers: RegisterEntry[];
   memory: Memory;
@@ -276,7 +298,6 @@ interface SimInterface {
    *  all. */
   values: Map<string, { value: number | boolean | null; ts_ms: number }>;
   poll_count: number;
-  error_count: number;
 }
 
 interface SimAgent {
@@ -288,7 +309,8 @@ interface SimAgent {
   /** While set and in the future, the extension is running but has registered
    *  nothing — the window every real Start passes through. */
   actionsReadyAt: number | null;
-  interfaces: Map<string, SimInterface>;
+  /** Keyed by `<connection>/<device>`. */
+  devices: Map<string, SimDevice>;
 }
 
 function emptyMemory(): Memory {
@@ -300,65 +322,106 @@ function emptyMemory(): Memory {
   };
 }
 
-function buildMeter(): SimInterface {
-  const registers = REGISTER_DEFS.map(toEntry);
-  const iface: SimInterface = {
-    entry: {
-      name: "meter",
+function deviceEntry(
+  connection: string,
+  device: string,
+  fields: Omit<
+    ModbusDeviceEntry,
+    | "name"
+    | "connection"
+    | "device"
+    | "trace_path"
+    | "connected"
+    | "successful_reads"
+    | "failed_reads"
+  >,
+): ModbusDeviceEntry {
+  const name = `${connection}/${device}`;
+  return {
+    name,
+    connection,
+    device,
+    connected: true,
+    trace_path: `Modbus/${name}`,
+    successful_reads: 0,
+    failed_reads: 0,
+    ...fields,
+  };
+}
+
+/** A power meter on the shared TCP connection; each unit has its own memory. */
+function buildMeter(unitId: number, base: AddressBase): SimDevice {
+  const registers = REGISTER_DEFS.map((def) => toEntry(def, base));
+  const dev: SimDevice = {
+    entry: deviceEntry("meter_panel", `unit${unitId}`, {
+      unit_id: unitId,
       transport: "tcp",
-      connected: true,
-      connection: "127.0.0.1:5020",
-      unit_id: 1,
-      source: "config.json",
+      endpoint: "127.0.0.1:5020",
       map_name: "power_meter",
+      address_base: base,
       register_count: registers.length,
-      poll_interval: 1,
+      rate: 1,
       write_mode: "auto",
-    },
+      // Headline = the worst tier: the slow one lags more.
+      requested_rate: 60,
+      achieved_rate: 63,
+      overload_pct: 5,
+      tiers: [
+        { requested_rate: 1, achieved_rate: 1.02, overload_pct: 2, blocks: 6 },
+        { requested_rate: 60, achieved_rate: 63, overload_pct: 5, blocks: 1 },
+      ],
+      demoted: false,
+      retry_in_s: null,
+    }),
     defs: REGISTER_DEFS,
     registers,
     memory: emptyMemory(),
     values: new Map(),
     poll_count: 0,
-    error_count: 0,
   };
   // Seed device memory, then run one poll sweep so the first snapshot has values.
-  // `registers[i]` is `toEntry(REGISTER_DEFS[i])` — built once, above.
+  // `registers[i]` is built from `REGISTER_DEFS[i]`, above.
   REGISTER_DEFS.forEach((def, i) => {
     const entry = registers[i];
     const seeded = def.live ? def.live(0, i) : def.seed;
     if (entry === undefined || seeded === undefined) return;
-    writeMemory(iface.memory, entry, seeded);
+    writeMemory(dev, entry, seeded);
   });
   // status/spare_sensor: all-ones words, i.e. a float32 NaN. `writeMemory` can't
   // put one there (encoding NaN throws, correctly), so the words go in directly.
-  iface.memory.holding.set(NAN_ADDRESS, 0xffff);
-  iface.memory.holding.set(NAN_ADDRESS + 1, 0xffff);
-  pollSweep(iface, Date.now());
-  return iface;
+  dev.memory.holding.set(NAN_ADDRESS, 0xffff);
+  dev.memory.holding.set(NAN_ADDRESS + 1, 0xffff);
+  pollSweep(dev, Date.now());
+  return dev;
 }
 
-/** A second interface with no register map — the raw-only path. */
-function buildProbe(): SimInterface {
+/** A device on a second (serial) connection with no register map: the raw-only
+ *  path. */
+function buildProbe(): SimDevice {
   return {
-    entry: {
-      name: "probe",
-      transport: "rtu",
-      connected: true,
-      connection: "/dev/ttyUSB0@9600",
+    entry: deviceEntry("dev_ttyUSB0", "probe", {
       unit_id: 3,
-      source: "config.json",
+      transport: "rtu",
+      endpoint: "/dev/ttyUSB0@9600",
       map_name: null,
+      // No map: the extension's default base.
+      address_base: 1,
       register_count: 0,
-      poll_interval: 2,
+      rate: 2,
       write_mode: "fc16",
-    },
+      // No registers, so nothing is polled.
+      requested_rate: null,
+      achieved_rate: null,
+      overload_pct: null,
+      tiers: [],
+      demoted: false,
+      retry_in_s: null,
+    }),
     defs: [],
     registers: [],
     memory: emptyMemory(),
     values: new Map(),
     poll_count: 0,
-    error_count: 0,
   };
 }
 
@@ -366,14 +429,13 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
   const ready = (): SimAgent => ({
     address,
     extInstalled: true,
-    extVersion: "0.1.5",
+    extVersion: "0.2.0",
     extState: "running",
     actionSet: "full",
     actionsReadyAt: null,
-    interfaces: new Map([
-      ["meter", buildMeter()],
-      ["probe", buildProbe()],
-    ]),
+    devices: new Map(
+      [buildMeter(1, 1), buildMeter(2, 0), buildProbe()].map((d) => [d.entry.name, d] as const),
+    ),
   });
 
   switch (scenario) {
@@ -388,43 +450,59 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
         extState: "installed",
         actionSet: "none",
         actionsReadyAt: null,
-        interfaces: new Map(),
+        devices: new Map(),
       };
     case "extension-stopped":
       return { ...ready(), extState: "stopped", actionSet: "none" };
     case "extension-outdated":
-      return { ...ready(), extVersion: "0.1.4", actionSet: "legacy" };
-    case "no-interfaces":
-      return { ...ready(), interfaces: new Map() };
+      return { ...ready(), extVersion: "0.1.5", actionSet: "legacy" };
+    case "no-devices":
+      return { ...ready(), devices: new Map() };
   }
 }
 
 // ─── Device memory helpers ─────────────────────────────────────────────────
 
-function writeMemory(memory: Memory, reg: RegisterEntry, value: number | boolean): void {
+/** A user-facing address in the device's base → the wire, or null when the
+ *  `count` addresses from it leave the wire range (actions.py `_wire`). */
+function toWire(dev: SimDevice, address: number, count = 1): number | null {
+  const wire = address - dev.entry.address_base;
+  return Number.isInteger(wire) && wire >= 0 && wire + count <= 0x10000 ? wire : null;
+}
+
+function addressRangeError(dev: SimDevice, address: unknown): string {
+  const base = dev.entry.address_base;
+  return `Address ${String(address)} out of range ${base}…${maxAddress(base)}`;
+}
+
+function writeMemory(dev: SimDevice, reg: RegisterEntry, value: number | boolean): void {
+  const { memory } = dev;
+  const wire = reg.address - dev.entry.address_base;
   if (isBitTable(reg.type)) {
     const table = reg.type === "coil" ? memory.coil : memory.discrete_input;
-    table.set(reg.address, Boolean(value));
+    table.set(wire, Boolean(value));
     return;
   }
   const words = encodeValue(value, reg.datatype, reg.scale, reg.byte_order);
   const table = reg.type === "input" ? memory.input : memory.holding;
-  words.forEach((word, i) => table.set(reg.address + i, word));
+  words.forEach((word, i) => table.set(wire + i, word));
 }
 
 /** Decode one register out of device memory, the way the extension does — and
  *  then sanitize it the way the extension's action boundary does: a non-finite
  *  float (an unpopulated sensor reading 0xffff 0xffff, say) has no JSON form, so
  *  it goes over the wire as `null` rather than failing the whole action. */
-function readMemory(memory: Memory, reg: RegisterEntry): number | boolean | null {
+function readMemory(dev: SimDevice, reg: RegisterEntry): number | boolean | null {
+  const { memory } = dev;
+  const wire = reg.address - dev.entry.address_base;
   if (isBitTable(reg.type)) {
     const table = reg.type === "coil" ? memory.coil : memory.discrete_input;
-    return table.get(reg.address) ?? false;
+    return table.get(wire) ?? false;
   }
   const table = reg.type === "input" ? memory.input : memory.holding;
   const words: number[] = [];
   for (let i = 0; i < wordCount(reg.datatype); i++) {
-    words.push(table.get(reg.address + i) ?? 0);
+    words.push(table.get(wire + i) ?? 0);
   }
   const decoded = decodeValue(words, reg.datatype, reg.scale, reg.byte_order);
   const value = typeof decoded === "bigint" ? Number(decoded) : decoded;
@@ -450,25 +528,26 @@ function readRange(
 }
 
 /** One poll cycle: refresh the last-polled cache for every register the
- *  interface actually polls. `poll_interval: 0` registers are skipped, so they
+ *  device actually polls. `rate: 0` registers are skipped, so they
  *  never appear in a snapshot — the app has to read them on demand. */
-function pollSweep(iface: SimInterface, now: number): void {
-  for (const reg of iface.registers) {
-    if (reg.poll_interval === 0) continue;
-    iface.values.set(reg.path, { value: readMemory(iface.memory, reg), ts_ms: now });
+function pollSweep(dev: SimDevice, now: number): void {
+  for (const reg of dev.registers) {
+    if (reg.rate === 0) continue;
+    dev.values.set(reg.path, { value: readMemory(dev, reg), ts_ms: now });
   }
-  iface.poll_count += 1;
+  dev.poll_count += 1;
+  if (dev.registers.length > 0) dev.entry.successful_reads += 1;
 }
 
 /** Advance the simulated device: measurement registers move, configuration
  *  registers (setpoints, coils, calibration) keep whatever was written to them. */
-function tick(iface: SimInterface, elapsedSeconds: number): void {
-  iface.defs.forEach((def, i) => {
-    const entry = iface.registers[i];
+function tick(dev: SimDevice, elapsedSeconds: number): void {
+  dev.defs.forEach((def, i) => {
+    const entry = dev.registers[i];
     if (!def.live || entry === undefined) return;
-    writeMemory(iface.memory, entry, def.live(elapsedSeconds, i));
+    writeMemory(dev, entry, def.live(elapsedSeconds, i));
   });
-  pollSweep(iface, Date.now());
+  pollSweep(dev, Date.now());
 }
 
 // ─── Install ───────────────────────────────────────────────────────────────
@@ -488,7 +567,7 @@ export function installModbusMockHost(bridge: MockBridge, opts: MockHostOptions 
     const elapsed = (Date.now() - startedAt) / 1000;
     for (const agent of agentMap.values()) {
       if (agent.extState !== "running") continue;
-      for (const iface of agent.interfaces.values()) tick(iface, elapsed);
+      for (const device of agent.devices.values()) tick(device, elapsed);
     }
   }, TICK_MS);
 
@@ -534,13 +613,12 @@ function buildActionsList(agentMap: Map<string, SimAgent>) {
     // Running, but still inside its registration window: the process is up and
     // not one action exists yet.
     const starting = a.actionsReadyAt !== null && Date.now() < a.actionsReadyAt;
-    const methods =
+    out[addr] =
       a.actionSet === "none" || starting
         ? []
         : a.actionSet === "legacy"
-          ? LEGACY_ACTIONS
-          : [...REQUIRED_MODBUS_METHODS, MODBUS_METHODS.getStatus];
-    out[addr] = methods.map((m) => modbusActionPath(m));
+          ? LEGACY_ACTION_PATHS
+          : REQUIRED_MODBUS_METHODS.map((m) => modbusActionPath(m));
   }
   return out;
 }
@@ -601,35 +679,44 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
 
   const agent = agentMap.get(agentAddr);
   if (!agent) throw new Error(`mock-host: unknown agent "${agentAddr}"`);
-  if (!action.startsWith("modbus/")) {
-    throw new Error(`mock-host: action path doesn't start with modbus/: ${action}`);
+  if (!action.startsWith(MODBUS_ACTION_PREFIX)) {
+    throw new Error(`mock-host: action path doesn't start with ${MODBUS_ACTION_PREFIX}: ${action}`);
   }
-  const method = action.slice("modbus/".length);
+  const method = action.slice(MODBUS_ACTION_PREFIX.length);
   const args = (actionParams ?? {}) as Record<string, unknown>;
 
-  if (method === MODBUS_METHODS.listInterfaces) {
-    const interfaces = [...agent.interfaces.values()].map((i) => i.entry);
-    return { status: "done", result: { interfaces, count: interfaces.length, success: true } };
+  if (method === MODBUS_METHODS.listDevices) {
+    const devices = [...agent.devices.values()].map((d) => d.entry);
+    return { status: "done", result: { devices, count: devices.length, success: true } };
   }
 
-  const ifaceName = typeof args.interface === "string" ? args.interface : "";
-  const iface = agent.interfaces.get(ifaceName);
-  if (!iface) return failure(`Interface '${ifaceName}' not found`);
+  const deviceName = typeof args.device === "string" ? args.device : "";
+  const dev = agent.devices.get(deviceName);
+  if (!dev) return failure(`Device '${deviceName}' not found`);
 
   switch (method) {
     case MODBUS_METHODS.getSnapshot: {
       const values: Record<string, { value: number | boolean | null; ts_ms: number }> = {};
-      for (const [path, entry] of iface.values) values[path] = entry;
+      for (const [path, entry] of dev.values) values[path] = entry;
       return {
         status: "done",
         result: {
-          interface: ifaceName,
-          connected: iface.entry.connected,
-          transport: iface.entry.transport,
-          connection: iface.entry.connection,
-          unit_id: iface.entry.unit_id,
-          poll_count: iface.poll_count,
-          error_count: iface.error_count,
+          device: deviceName,
+          connection: dev.entry.connection,
+          connected: dev.entry.connected,
+          transport: dev.entry.transport,
+          endpoint: dev.entry.endpoint,
+          unit_id: dev.entry.unit_id,
+          address_base: dev.entry.address_base,
+          poll_count: dev.poll_count,
+          successful_reads: dev.entry.successful_reads,
+          failed_reads: dev.entry.failed_reads,
+          requested_rate: dev.entry.requested_rate,
+          achieved_rate: dev.entry.achieved_rate,
+          overload_pct: dev.entry.overload_pct,
+          tiers: dev.entry.tiers,
+          demoted: dev.entry.demoted,
+          retry_in_s: dev.entry.retry_in_s,
           captured_at_unix_ms: Date.now(),
           values,
           success: true,
@@ -641,16 +728,16 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
       return {
         status: "done",
         result: {
-          registers: iface.registers,
-          count: iface.registers.length,
-          map_name: iface.entry.map_name,
+          registers: dev.registers,
+          count: dev.registers.length,
+          map_name: dev.entry.map_name,
         },
       };
 
     case MODBUS_METHODS.readNamedRegister: {
-      const reg = findRegister(iface, args.name);
+      const reg = findRegister(dev, args.name);
       if (!reg) return failure(`Register '${String(args.name)}' not found`);
-      const value = readMemory(iface.memory, reg);
+      const value = readMemory(dev, reg);
       return done({
         name: reg.path,
         address: reg.address,
@@ -662,18 +749,18 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
     }
 
     case MODBUS_METHODS.writeNamedRegister: {
-      const reg = findRegister(iface, args.name);
+      const reg = findRegister(dev, args.name);
       if (!reg) return failure(`Register '${String(args.name)}' not found`);
       if (!reg.writable) {
         return failure(`Register '${reg.path}' is not writable (type: ${reg.type})`);
       }
       const value = Number(args.value);
       if (!Number.isFinite(value)) return failure(`Value '${String(args.value)}' is not a number`);
-      writeMemory(iface.memory, reg, isBitTable(reg.type) ? value !== 0 : value);
+      writeMemory(dev, reg, isBitTable(reg.type) ? value !== 0 : value);
       // Polled registers show the new value on the next sweep; refresh the cache
       // immediately for the ones that are polled so the UI feels live.
-      if (reg.poll_interval !== 0) {
-        iface.values.set(reg.path, { value: readMemory(iface.memory, reg), ts_ms: Date.now() });
+      if (reg.rate !== 0) {
+        dev.values.set(reg.path, { value: readMemory(dev, reg), ts_ms: Date.now() });
       }
       return done({
         name: reg.path,
@@ -688,12 +775,13 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
     case MODBUS_METHODS.readRegister: {
       const address = Number(args.address);
       const count = Number(args.count ?? 1);
-      // The extension's own branch is if/elif/else over the three named tables,
-      // so anything unrecognized lands on the final else — discrete inputs.
-      const type = isRegisterTableType(args.reg_type) ? args.reg_type : "discrete_input";
-      if (!Number.isInteger(address) || address < 0 || address > 65535) {
-        return failure(`Address ${String(args.address)} out of range`);
+      // The extension looks the table up in `READ_METHODS`; an unknown one raises.
+      if (!isRegisterTableType(args.reg_type)) {
+        throw new Error(`mock-host: unknown reg_type ${String(args.reg_type)}`);
       }
+      const type = args.reg_type;
+      const wire = toWire(dev, address, count);
+      if (wire === null) return failure(addressRangeError(dev, args.address));
       if (!Number.isInteger(count) || count < 1 || count > MAX_READ_COUNT) {
         return failure(`Count ${String(args.count)} out of range 1…${MAX_READ_COUNT}`);
       }
@@ -703,7 +791,7 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
           address,
           type,
           count,
-          values: readRange(iface.memory, type, address, count),
+          values: readRange(dev.memory, type, wire, count),
           success: true,
         },
       };
@@ -715,7 +803,9 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
       if (!Number.isInteger(address) || !Number.isFinite(value)) {
         return failure("write_single_register needs an integer address and numeric value");
       }
-      iface.memory.holding.set(address, Math.trunc(value) & 0xffff);
+      const wire = toWire(dev, address);
+      if (wire === null) return failure(addressRangeError(dev, args.address));
+      dev.memory.holding.set(wire, Math.trunc(value) & 0xffff);
       return { status: "done", result: { address, value, function_code: 6, success: true } };
     }
 
@@ -731,7 +821,9 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
       if (!Number.isInteger(address) || parsed.some((v) => !Number.isInteger(v))) {
         return failure("Values must be comma-separated integers");
       }
-      parsed.forEach((word, i) => iface.memory.holding.set(address + i, word & 0xffff));
+      const wire = toWire(dev, address, parsed.length);
+      if (wire === null) return failure(addressRangeError(dev, args.address));
+      parsed.forEach((word, i) => dev.memory.holding.set(wire + i, word & 0xffff));
       return {
         status: "done",
         result: {
@@ -747,20 +839,19 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
     case MODBUS_METHODS.writeCoil: {
       const address = Number(args.address);
       if (!Number.isInteger(address)) return failure("write_coil needs an integer address");
+      const wire = toWire(dev, address);
+      if (wire === null) return failure(addressRangeError(dev, args.address));
       const on = args.value === "ON";
-      iface.memory.coil.set(address, on);
+      dev.memory.coil.set(wire, on);
       return { status: "done", result: { address, value: on, success: true } };
     }
 
-    // `get_status` stays in the advertised action list (a 0.1.4-era extension is
-    // recognized by it) but nothing in the app calls it: the header reads
-    // `get_snapshot`, which carries the same counters.
     default:
       throw new Error(`mock-host: unknown method "${method}"`);
   }
 }
 
-function findRegister(iface: SimInterface, name: unknown): RegisterEntry | undefined {
+function findRegister(dev: SimDevice, name: unknown): RegisterEntry | undefined {
   if (typeof name !== "string") return undefined;
-  return iface.registers.find((r) => r.path === name || r.name === name);
+  return dev.registers.find((r) => r.path === name || r.name === name);
 }

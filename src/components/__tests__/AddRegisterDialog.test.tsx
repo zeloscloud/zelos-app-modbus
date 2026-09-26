@@ -39,7 +39,8 @@ function renderDialog({ registers = CATALOG }: { registers?: readonly RegisterEn
     <AddRegisterDialog
       open
       onOpenChange={onOpenChange}
-      interfaceName="meter"
+      deviceName="meter"
+      addressBase={1}
       registers={registers}
       onAdd={onAdd}
       onAddRaw={onAddRaw}
@@ -146,7 +147,7 @@ describe("AddRegisterDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("offers the raw row even when the interface has no register map", () => {
+  it("offers the raw row even when the device has no register map", () => {
     const { onAddRaw } = renderDialog({ registers: [] });
     expect(screen.getByText(/no register map/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /add raw row/i }));

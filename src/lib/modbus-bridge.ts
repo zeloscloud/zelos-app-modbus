@@ -6,9 +6,9 @@
  *  no retries, no debouncing. Let TanStack Query own those.
  *
  *  Wire model: the Modbus extension exposes a single global action namespace
- *  (`modbus/get_snapshot`, `modbus/write_coil`, …). Every per-interface action
- *  carries an `interface` parameter naming the target client; interface
- *  discovery is via {@link listInterfaces}.
+ *  (`Modbus/get_snapshot`, `Modbus/write_coil`, …). Every per-device action
+ *  carries a `device` parameter (`<connection>/<device>`) naming the target;
+ *  device discovery is via {@link listDevices}.
  *
  *  Failure model: the extension signals most failures *inside* a successful
  *  action envelope — status stays `"done"` and the payload is
@@ -21,7 +21,7 @@ import { actions, type BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import {
   MODBUS_METHODS,
   modbusActionPath,
-  type ListInterfacesResult,
+  type ListDevicesResult,
   type ListRegistersResult,
   type ModbusActionResult,
   type ModbusErrorPayload,
@@ -35,34 +35,34 @@ import {
   type WriteSingleRegisterResult,
 } from "./types";
 
-/** Names of every interface the extension currently has configured on the named
- *  agent. The capability resolver consumes this to enumerate ready targets. */
-export async function listInterfaces(
+/** Every device the extension currently has configured on the named agent.
+ *  The capability resolver consumes this to enumerate ready targets. */
+export async function listDevices(
   bridge: BridgeTransport,
   agent: string,
-): Promise<ListInterfacesResult> {
-  return call<ListInterfacesResult>(bridge, agent, MODBUS_METHODS.listInterfaces, {});
+): Promise<ListDevicesResult> {
+  return call<ListDevicesResult>(bridge, agent, MODBUS_METHODS.listDevices, {});
 }
 
-/** Last-polled value cache for one interface. No device I/O — safe at 1 Hz even
+/** Last-polled value cache for one device. No device I/O — safe at 1 Hz even
  *  on a slow RTU link. */
 export async function getSnapshot(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
 ): Promise<ModbusSnapshot> {
-  return call<ModbusSnapshot>(bridge, agent, MODBUS_METHODS.getSnapshot, { interface: iface });
+  return call<ModbusSnapshot>(bridge, agent, MODBUS_METHODS.getSnapshot, { device });
 }
 
-/** Register catalog for one interface. Only changes when the extension restarts
+/** Register catalog for one device. Only changes when the extension restarts
  *  with a different map. */
 export async function listRegisters(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
 ): Promise<ListRegistersResult> {
   return call<ListRegistersResult>(bridge, agent, MODBUS_METHODS.listRegisters, {
-    interface: iface,
+    device,
   });
 }
 
@@ -71,12 +71,12 @@ export async function listRegisters(
 export async function readNamedRegister(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
   /** `"<event>/<name>"`. */
   name: string,
 ): Promise<NamedRegisterResult> {
   return call<NamedRegisterResult>(bridge, agent, MODBUS_METHODS.readNamedRegister, {
-    interface: iface,
+    device,
     name,
   });
 }
@@ -84,12 +84,12 @@ export async function readNamedRegister(
 export async function writeNamedRegister(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
   name: string,
   value: number,
 ): Promise<NamedRegisterResult> {
   return call<NamedRegisterResult>(bridge, agent, MODBUS_METHODS.writeNamedRegister, {
-    interface: iface,
+    device,
     name,
     value,
   });
@@ -101,11 +101,11 @@ export async function writeNamedRegister(
 export async function readRegister(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
   params: { address: number; reg_type: RegisterTableType; count: number },
 ): Promise<RawReadResult> {
   return call<RawReadResult>(bridge, agent, MODBUS_METHODS.readRegister, {
-    interface: iface,
+    device,
     ...params,
   });
 }
@@ -114,12 +114,12 @@ export async function readRegister(
 export async function writeSingleRegister(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
   address: number,
   value: number,
 ): Promise<WriteSingleRegisterResult> {
   return call<WriteSingleRegisterResult>(bridge, agent, MODBUS_METHODS.writeSingleRegister, {
-    interface: iface,
+    device,
     address,
     value,
   });
@@ -130,12 +130,12 @@ export async function writeSingleRegister(
 export async function writeRegisters(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
   address: number,
   values: readonly number[],
 ): Promise<WriteRegistersResult> {
   return call<WriteRegistersResult>(bridge, agent, MODBUS_METHODS.writeRegisters, {
-    interface: iface,
+    device,
     address,
     values: values.map((v) => String(v)).join(","),
   });
@@ -145,12 +145,12 @@ export async function writeRegisters(
 export async function writeCoil(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
   address: number,
   value: boolean,
 ): Promise<WriteCoilResult> {
   return call<WriteCoilResult>(bridge, agent, MODBUS_METHODS.writeCoil, {
-    interface: iface,
+    device,
     address,
     value: value ? "ON" : "OFF",
   });

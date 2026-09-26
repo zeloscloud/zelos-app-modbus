@@ -1,8 +1,8 @@
-/** One section per Modbus interface: a live status header, then the one table
+/** One section per Modbus device: a live status header, then the one table
  *  holding every row the user added to it — catalog registers and arbitrary
  *  addresses side by side, in insertion order.
  *
- *  An interface with no register map (`map_name === null`) is not a special case
+ *  A device with no register map (`map_name === null`) is not a special case
  *  any more: its catalog is simply empty, so only raw rows can be added to it. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
@@ -15,7 +15,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useRegisters } from "@/hooks/use-registers";
 import { useSnapshot } from "@/hooks/use-snapshot";
-import type { ModbusInterfaceEntry, RegisterEntry } from "@/lib/types";
+import type { ModbusDeviceEntry, PollHealth, RegisterEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { defaultRawRow, type NewWatchRow, type RowPatch, type WatchRow } from "@/lib/watch-store";
 
@@ -25,34 +25,38 @@ const SNAPSHOT_STALE_MS = 5_000;
 
 const NO_REGISTERS: readonly RegisterEntry[] = [];
 
-export interface InterfacePanelProps {
+/** Achieved slower than 2× requested: the device can't keep up. */
+const OVERLOAD_WARN_PCT = 100;
+
+export interface DevicePanelProps {
   bridge: BridgeTransport;
   agentAddress: string;
-  iface: ModbusInterfaceEntry;
-  /** Rows already filtered to this (agent, interface), in insertion order. */
+  device: ModbusDeviceEntry;
+  /** Rows already filtered to this (agent, device), in insertion order. */
   rows: readonly WatchRow[];
   onAddRow: (input: NewWatchRow) => WatchRow;
   onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
 }
 
-export function InterfacePanel({
+export function DevicePanel({
   bridge,
   agentAddress,
-  iface,
+  device,
   rows,
   onAddRow,
   onUpdateRow,
   onRemoveRow,
-}: InterfacePanelProps) {
+}: DevicePanelProps) {
   const [pickerOpen, setPickerOpen] = React.useState(false);
-  const snapshotQuery = useSnapshot(bridge, agentAddress, iface.name);
+  const snapshotQuery = useSnapshot(bridge, agentAddress, device.name);
   const registersQuery = useRegisters(
     bridge,
     agentAddress,
-    iface.name,
-    iface.map_name,
-    iface.register_count,
+    device.name,
+    device.map_name,
+    device.register_count,
+    device.address_base,
   );
 
   const snapshot = snapshotQuery.data;
@@ -63,33 +67,30 @@ export function InterfacePanel({
   const registers = registersQuery.data?.registers ?? NO_REGISTERS;
   const catalogError = registersQuery.error instanceof Error ? registersQuery.error : null;
   // Named rows would flash as orphans if they rendered before the catalog they
-  // join against, so a mapped interface waits for it. Raw rows don't care.
-  const catalogPending = iface.map_name !== null && registersQuery.isLoading;
-  // An interface with no map has nothing to join against and never will, so a
+  // join against, so a mapped device waits for it. Raw rows don't care.
+  const catalogPending = device.map_name !== null && registersQuery.isLoading;
+  // A device with no map has nothing to join against and never will, so a
   // named row on it really is orphaned. A catalog that failed to load says
   // nothing about any row — those rows keep working on their paths alone.
-  const catalogReady = iface.map_name === null || registersQuery.isSuccess;
+  const catalogReady = device.map_name === null || registersQuery.isSuccess;
   const retryCatalog = registersQuery.refetch;
 
   const openPicker = React.useCallback(() => setPickerOpen(true), []);
   const addRegister = React.useCallback(
     (reg: RegisterEntry) =>
-      onAddRow({ kind: "named", agent: agentAddress, interface: iface.name, path: reg.path }),
-    [onAddRow, agentAddress, iface.name],
+      onAddRow({ kind: "named", agent: agentAddress, device: device.name, path: reg.path }),
+    [onAddRow, agentAddress, device.name],
   );
   const addRawRow = React.useCallback(
-    () => onAddRow(defaultRawRow(agentAddress, iface.name)),
-    [onAddRow, agentAddress, iface.name],
+    () => onAddRow(defaultRawRow(agentAddress, device.name, device.address_base)),
+    [onAddRow, agentAddress, device.name, device.address_base],
   );
 
   return (
     <div className="rounded-lg border border-border bg-background/40">
       <div className="flex flex-col gap-1 px-3 py-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
-          <strong className="text-sm">{iface.name}</strong>
-          <Badge variant="outline" className="font-mono">
-            {iface.transport.toUpperCase()} {iface.connection}
-          </Badge>
+          <strong className="text-sm">{device.device}</strong>
           {snapshotError ? (
             <Badge variant="destructive" className="gap-1">
               <AlertCircle className="h-3 w-3" />
@@ -103,19 +104,32 @@ export function InterfacePanel({
           ) : (
             <ConnectionBadge connected={snapshot.connected} stale={stale} />
           )}
-          {iface.map_name !== null ? (
-            <span className="text-muted-foreground">map {iface.map_name}</span>
+          {snapshot?.demoted && (
+            <Badge variant="warning">
+              demoted
+              {snapshot.retry_in_s !== null && `, retry in ${Math.ceil(snapshot.retry_in_s)}s`}
+            </Badge>
+          )}
+          {device.map_name !== null ? (
+            <span className="text-muted-foreground">map {device.map_name}</span>
           ) : (
             <Badge variant="warning">raw only</Badge>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[11px] text-muted-foreground">
-          <span>unit {iface.unit_id}</span>
+          <span>unit {device.unit_id}</span>
           <span>polls {snapshot?.poll_count ?? "—"}</span>
-          <span>errors {snapshot?.error_count ?? "—"}</span>
-          <span>every {iface.poll_interval}s</span>
-          <span>write {iface.write_mode}</span>
-          <span>{iface.register_count} regs</span>
+          <span>reads {snapshot?.successful_reads ?? "—"}</span>
+          <span
+            className={cn(
+              (snapshot?.failed_reads ?? 0) > 0 && "text-amber-600 dark:text-amber-400",
+            )}
+          >
+            failed {snapshot?.failed_reads ?? "—"}
+          </span>
+          <RateStat health={snapshot ?? device} />
+          <span>write {device.write_mode}</span>
+          <span>{device.register_count} regs</span>
         </div>
         {snapshotError && <p className="text-[11px] text-destructive">{snapshotError.message}</p>}
       </div>
@@ -163,8 +177,9 @@ export function InterfacePanel({
             <RegisterTable
               bridge={bridge}
               agentAddress={agentAddress}
-              interfaceName={iface.name}
-              interfacePollInterval={iface.poll_interval}
+              deviceName={device.name}
+              addressBase={device.address_base}
+              writeMode={device.write_mode}
               registers={registers}
               rows={rows}
               catalogReady={catalogReady}
@@ -177,7 +192,8 @@ export function InterfacePanel({
             <AddRegisterDialog
               open={pickerOpen}
               onOpenChange={setPickerOpen}
-              interfaceName={iface.name}
+              deviceName={device.name}
+              addressBase={device.address_base}
               registers={registers}
               onAdd={addRegister}
               onAddRaw={addRawRow}
@@ -186,6 +202,27 @@ export function InterfacePanel({
         )}
       </div>
     </div>
+  );
+}
+
+/** Requested vs measured poll rate of the device's worst tier. */
+function RateStat({ health }: { health: PollHealth & { connected: boolean } }) {
+  const { requested_rate: requested, achieved_rate: achieved, overload_pct: overloadPct } = health;
+  if (requested === null) return <span>not polled</span>;
+  // The link is down: no rate is achieved, whatever the last one was.
+  if (!health.connected) return <span>rate {requested}s (disconnected)</span>;
+  const overloaded = overloadPct !== null && overloadPct > OVERLOAD_WARN_PCT;
+  return (
+    <span
+      className={cn(overloaded && "text-amber-600 dark:text-amber-400")}
+      title={
+        overloadPct === null
+          ? undefined
+          : `Worst tier (${requested}s): ${Math.round(overloadPct)}% slower than requested`
+      }
+    >
+      rate {requested}s{achieved !== null && ` (achieved ${Number(achieved.toFixed(2))}s)`}
+    </span>
   );
 }
 

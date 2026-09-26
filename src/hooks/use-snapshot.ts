@@ -1,11 +1,11 @@
-/** TanStack Query hook for the per-interface `get_snapshot` poll.
+/** TanStack Query hook for the per-device `get_snapshot` poll.
  *
  *  Polls at 1 Hz. The action reads the extension's last-polled value cache —
- *  it never touches the device — so the cadence is independent of the interface's
+ *  it never touches the device — so the cadence is independent of the device's
  *  own poll interval and costs nothing on a slow RTU link.
  *
- *  Query keys are `["modbus-snapshot", agent, interface]`, so every component
- *  that wants this interface's values (header stats, each register row) shares a
+ *  Query keys are `["modbus-snapshot", agent, device]`, so every component
+ *  that wants this device's values (header stats, each register row) shares a
  *  single underlying poll via TanStack's key dedup instead of fanning out one
  *  request per subscriber. */
 
@@ -20,11 +20,11 @@ const SNAPSHOT_POLL_MS = 1_000;
 export function useSnapshot(
   bridge: BridgeTransport,
   agent: string,
-  iface: string,
+  device: string,
 ): UseQueryResult<ModbusSnapshot> {
   return useQuery<ModbusSnapshot>({
-    queryKey: ["modbus-snapshot", agent, iface],
-    queryFn: async () => getSnapshot(bridge, agent, iface),
+    queryKey: ["modbus-snapshot", agent, device],
+    queryFn: async () => getSnapshot(bridge, agent, device),
     staleTime: SNAPSHOT_POLL_MS,
     refetchInterval: SNAPSHOT_POLL_MS,
     refetchOnWindowFocus: true,

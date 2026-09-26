@@ -48,9 +48,10 @@ function Harness({ snap }: { snap: ModbusSnapshot }) {
   return (
     <RegisterTable
       bridge={BRIDGE}
+      writeMode="auto"
       agentAddress="localhost:2300"
-      interfaceName="meter"
-      interfacePollInterval={1}
+      deviceName="meter"
+      addressBase={1}
       registers={CATALOG}
       rows={rows}
       catalogReady

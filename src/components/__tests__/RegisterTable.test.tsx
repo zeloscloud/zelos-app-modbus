@@ -45,7 +45,7 @@ const CATALOG: readonly RegisterEntry[] = [
     address: 104,
     datatype: "uint32",
     unit: "",
-    poll_interval: 0,
+    rate: 0,
   }),
   register({
     event: "control",
@@ -97,8 +97,9 @@ function renderTable(opts: TableOptions) {
       <RegisterTable
         bridge={bridge}
         agentAddress="localhost:2300"
-        interfaceName="meter"
-        interfacePollInterval={1}
+        deviceName="meter"
+        addressBase={1}
+        writeMode="auto"
         registers={registers}
         rows={rows}
         catalogReady={opts.catalogReady ?? true}
@@ -282,7 +283,7 @@ describe("RegisterTable rows", () => {
     expect(cell(row, COL.unit)).toHaveTextContent("°C");
   });
 
-  it("hints that a poll_interval: 0 register is not polled", () => {
+  it("hints that a rate: 0 register is not polled", () => {
     renderTable({ rows: watchRows(["setpoints/energy_reset"]), snap: snapshot({}) });
     expect(screen.getByText("not polled")).toBeInTheDocument();
   });
@@ -399,7 +400,7 @@ describe("RegisterTable unrepresentable values", () => {
    *  carry — what the extension sends for a NaN or ±Inf off the wire. */
   function nullValueBridge(actions: string[] = []): BridgeTransport {
     return bridgeStub((action) => {
-      actions.push(action.replace(/^modbus\//, ""));
+      actions.push(action.replace(/^Modbus\//, ""));
       return {
         name: "power/total",
         address: 12,
@@ -604,9 +605,9 @@ describe("RegisterTable raw rows", () => {
     });
   }
 
-  /** The actions issued, in order, without the `modbus/` prefix. */
+  /** The actions issued, in order, without the `Modbus/` prefix. */
   function actions(calls: RawCall[]): string[] {
-    return calls.map((c) => c.action.replace(/^modbus\//, ""));
+    return calls.map((c) => c.action.replace(/^Modbus\//, ""));
   }
 
   function select(row: HTMLElement, name: string): HTMLSelectElement {
@@ -621,7 +622,7 @@ describe("RegisterTable raw rows", () => {
     expect(cell(row, COL.register)).toHaveTextContent("—");
     expect(cell(row, COL.unit)).toHaveTextContent("—");
     // …and puts an editor in each of the three it does.
-    expect(within(cell(row, COL.address)).getByLabelText("Raw address")).toHaveValue("0");
+    expect(within(cell(row, COL.address)).getByLabelText("Raw address")).toHaveValue("1");
     expect(select(row, "Raw table")).toHaveValue("holding");
     expect(select(row, "Raw datatype")).toHaveValue("uint16");
   });
@@ -659,12 +660,12 @@ describe("RegisterTable raw rows", () => {
     expect(select(bodyRow(), "Raw datatype")).toBeEnabled();
   });
 
-  it("offers a word-order select only where word order can matter", () => {
+  it("offers a byte-order select only where byte order can matter", () => {
     const view = renderTable({ rows: [rawRow({ datatype: "uint16" })] });
-    expect(within(bodyRow()).queryByLabelText("Raw word order")).not.toBeInTheDocument();
+    expect(within(bodyRow()).queryByLabelText("Byte order")).not.toBeInTheDocument();
 
     fireEvent.change(select(bodyRow(), "Raw datatype"), { target: { value: "float32" } });
-    const order = select(bodyRow(), "Raw word order");
+    const order = select(bodyRow(), "Byte order");
     expect(order).toHaveValue("big");
     fireEvent.change(order, { target: { value: "big_swap" } });
     expect(storedRaw(view).byte_order).toBe("big_swap");
@@ -862,7 +863,7 @@ describe("RegisterTable without a catalog", () => {
   it("sends an unvalidated write and lets the extension have the last word", async () => {
     const sent: unknown[] = [];
     const bridge = bridgeStub((action, params) => {
-      sent.push({ action: action.replace(/^modbus\//, ""), value: params.value });
+      sent.push({ action: action.replace(/^Modbus\//, ""), value: params.value });
       return { name: "power/total", value: params.value, success: true };
     });
     renderUnjoined(bridge);
@@ -892,7 +893,7 @@ describe("RegisterTable row locking", () => {
       release = r;
     });
     const bridge = bridgeStub((action, params) => {
-      calls.push(action.replace(/^modbus\//, ""));
+      calls.push(action.replace(/^Modbus\//, ""));
       return gate.then(() => ({ name: "power/total", value: params.value ?? 1, success: true }));
     });
     return { bridge, resolve: () => release(), calls };

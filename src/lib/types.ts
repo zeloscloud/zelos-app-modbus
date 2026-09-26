@@ -28,11 +28,11 @@ export const MODBUS_EXTENSION_INSTALL_IDS: ReadonlySet<string> = new Set([
 ]);
 
 /** Bare method names exposed by the Modbus extension. The on-wire surface is a
- *  single global namespace: every method is `modbus/<method>` and takes an
- *  `interface` parameter (the registry key) to select which client to operate
- *  on. Use {@link modbusActionPath} to build a full path. */
+ *  single global namespace: every method is `Modbus/<method>` and takes a
+ *  `device` parameter (`<connection>/<device>`, the registry key) to select the
+ *  target. Use {@link modbusActionPath} to build a full path. */
 export const MODBUS_METHODS = {
-  listInterfaces: "list_interfaces",
+  listDevices: "list_devices",
   getSnapshot: "get_snapshot",
   listRegisters: "list_registers",
   readNamedRegister: "read_named_register",
@@ -41,19 +41,16 @@ export const MODBUS_METHODS = {
   writeSingleRegister: "write_single_register",
   writeRegisters: "write_registers",
   writeCoil: "write_coil",
-  /** Legacy status action. Superseded by `get_snapshot`, which returns the same
-   *  counters plus cached values in one round-trip — the app never calls it. */
-  getStatus: "get_status",
 } as const;
 
 export type ModbusMethodName = (typeof MODBUS_METHODS)[keyof typeof MODBUS_METHODS];
 
 /** Action paths every running Modbus extension must surface before the app
- *  considers it ready. `list_interfaces`, `get_snapshot` and the enriched
- *  `list_registers` land in extension 0.1.5; the rest have existed since
- *  0.1.x. A missing entry means "extension too old", not "misconfigured". */
+ *  considers it ready. The `Modbus/` namespace and `list_devices` land in
+ *  extension 0.2.0. A missing entry means "extension too old", not
+ *  "misconfigured". */
 export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = [
-  MODBUS_METHODS.listInterfaces,
+  MODBUS_METHODS.listDevices,
   MODBUS_METHODS.getSnapshot,
   MODBUS_METHODS.listRegisters,
   MODBUS_METHODS.readNamedRegister,
@@ -66,10 +63,10 @@ export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = [
 
 /** First extension release carrying the required action set. Used in
  *  remediation copy only — the action-path check above is the real guard. */
-export const MIN_MODBUS_EXTENSION_VERSION = "0.1.5";
+export const MIN_MODBUS_EXTENSION_VERSION = "0.2.0";
 
 /** Namespace every Modbus action path sits under. */
-export const MODBUS_ACTION_PREFIX = "modbus/";
+export const MODBUS_ACTION_PREFIX = "Modbus/";
 
 /** Build the full action path for a given method. */
 export function modbusActionPath(method: ModbusMethodName | string): string {
@@ -107,6 +104,11 @@ export type ByteOrder = (typeof BYTE_ORDERS)[number];
 
 export type ModbusTransport = "tcp" | "rtu";
 
+/** Per-device address base. User-facing addresses (map entries and raw action
+ *  params) are in this base; the extension subtracts it to get the wire address.
+ *  1 (holding "1" = wire 0) unless the map sets `address_base: 0`. */
+export type AddressBase = 0 | 1;
+
 /** Workspace mode as reported by the host bridge — taken straight from the SDK
  *  rather than restated here, because it is the SDK's bridge shape and not a
  *  frozen Python wire shape like everything else in this file. It stays an open
@@ -114,33 +116,77 @@ export type ModbusTransport = "tcp" | "rtu";
  *  simply not "LIVE" and disables actions. */
 export type WorkspaceModeKind = AppBridgeWorkspaceInfo["modeKind"];
 
-// ─── modbus/list_interfaces ─────────────────────────────────────────────────
+// ─── Modbus/list_devices ────────────────────────────────────────────────────
 
-export interface ModbusInterfaceEntry {
-  /** Registry key — exactly the value the `interface` action param accepts. */
+/** One device (unit ID) on one connection. Devices on a connection share its
+ *  link, endpoint and connected state. */
+export interface ModbusDeviceEntry extends PollHealth {
+  /** Registry key `<connection>/<device>`: exactly what the `device` param takes. */
   name: string;
-  transport: ModbusTransport;
-  connected: boolean;
-  /** Human-readable endpoint: `host:port` (TCP) or `port@baud` (RTU). */
+  /** Connection name (a TCP endpoint or serial port). */
   connection: string;
+  /** Device name, unique within its connection. */
+  device: string;
   unit_id: number;
-  /** Where the interface came from (config file / discovery). */
-  source: string;
-  /** Register-map name, or null when the interface runs raw-only. */
+  transport: ModbusTransport;
+  /** `host:port` (TCP) or `port@baud` (RTU). */
+  endpoint: string;
+  connected: boolean;
+  /** Trace path, e.g. `Modbus/10_0_0_5/unit1`; null before the trace is set up. */
+  trace_path: string | null;
+  /** Register-map name, or null when the device runs raw-only. */
   map_name: string | null;
+  /** 1 for a device with no map. */
+  address_base: AddressBase;
   register_count: number;
-  /** Default poll cadence in SECONDS. */
-  poll_interval: number;
+  /** Default requested poll rate in SECONDS. */
+  rate: number;
   write_mode: string;
 }
 
-export interface ListInterfacesResult {
-  interfaces: ModbusInterfaceEntry[];
+/** One poll tier: the blocks sharing a requested rate. */
+export interface PollTier {
+  /** Seconds. */
+  requested_rate: number;
+  /** Seconds; measured mean read interval, null until measured. */
+  achieved_rate: number | null;
+  /** `100 * (achieved / requested - 1)`, floored at 0; null until measured. */
+  overload_pct: number | null;
+  blocks: number;
+}
+
+/** Poll health, shared by `get_snapshot`, `get_status` and `list_devices` rows.
+ *  The headline rate fields describe the WORST tier: highest `overload_pct`
+ *  among measured tiers, or the fastest tier while none is measured. */
+export interface PollHealth {
+  /** Seconds; the worst tier's requested rate, null when nothing is polled. */
+  requested_rate: number | null;
+  /** Seconds; the worst tier's measured mean read interval, null until measured
+   *  and while the link is down. */
+  achieved_rate: number | null;
+  /** The worst tier's `100 * (achieved / requested - 1)`, floored at 0; null
+   *  until measured. */
+  overload_pct: number | null;
+  /** Every polled tier, sorted by `requested_rate`. */
+  tiers: PollTier[];
+  /** Reads that returned data. */
+  successful_reads: number;
+  /** Reads that failed; a timeout counts, and so does each read missed while
+   *  the link is down. */
+  failed_reads: number;
+  /** True while the device is skipped after consecutive timeouts. */
+  demoted: boolean;
+  /** Seconds until the next probe while demoted, else null. */
+  retry_in_s: number | null;
+}
+
+export interface ListDevicesResult {
+  devices: ModbusDeviceEntry[];
   count: number;
   success: boolean;
 }
 
-// ─── modbus/get_snapshot ────────────────────────────────────────────────────
+// ─── Modbus/get_snapshot ────────────────────────────────────────────────────
 
 export interface SnapshotValue {
   /** `null` when the polled value isn't representable in JSON: the extension
@@ -154,22 +200,25 @@ export interface SnapshotValue {
 }
 
 /** Last-polled cache — no device I/O. Registers that were never polled (or
- *  have `poll_interval: 0`) are absent from `values` entirely. */
-export interface ModbusSnapshot {
-  interface: string;
+ *  have `rate: 0`) are absent from `values` entirely. */
+export interface ModbusSnapshot extends PollHealth {
+  /** `<connection>/<device>`. */
+  device: string;
+  /** Connection name. */
+  connection: string;
   connected: boolean;
   transport: ModbusTransport;
-  connection: string;
+  endpoint: string;
   unit_id: number;
+  address_base: AddressBase;
   poll_count: number;
-  error_count: number;
   captured_at_unix_ms: number;
   /** Keyed by register path (`"<event>/<name>"`). */
   values: Record<string, SnapshotValue>;
   success: boolean;
 }
 
-// ─── modbus/list_registers ──────────────────────────────────────────────────
+// ─── Modbus/list_registers ──────────────────────────────────────────────────
 
 export interface RegisterEntry {
   name: string;
@@ -184,9 +233,9 @@ export interface RegisterEntry {
   description: string;
   writable: boolean;
   byte_order: ByteOrder;
-  /** Seconds. `null` inherits the interface default; `0` disables polling
-   *  (the register will never appear in a snapshot). */
-  poll_interval: number | null;
+  /** Effective requested poll rate in seconds, already resolved against the
+   *  device default. `0` means not polled (never appears in a snapshot). */
+  rate: number;
 }
 
 export interface ListRegistersResult {

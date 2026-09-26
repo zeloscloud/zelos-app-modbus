@@ -16,8 +16,9 @@ import {
   writeDefault,
   type ValueState,
 } from "./row-view";
-import type { ModbusSnapshot, RegisterEntry } from "./types";
+import type { RegisterEntry } from "./types";
 import type { RawWatchRow } from "./watch-store";
+import { snapshot } from "@/components/__tests__/register-fixtures";
 
 const CAPTURED = 1_700_000_000_000;
 
@@ -34,7 +35,7 @@ function reg(overrides: Partial<RegisterEntry> = {}): RegisterEntry {
     description: "",
     writable: true,
     byte_order: "big",
-    poll_interval: null,
+    rate: 1,
     ...overrides,
   };
 }
@@ -44,27 +45,13 @@ function raw(overrides: Partial<Omit<RawWatchRow, "id" | "kind">> = {}): RawWatc
     id: "r1",
     kind: "raw",
     agent: "localhost:2300",
-    interface: "meter",
+    device: "meter",
     address: "0",
+    base: 0,
     table: "holding",
     datatype: "uint16",
     byte_order: "big",
     ...overrides,
-  };
-}
-
-function snapshot(values: ModbusSnapshot["values"]): ModbusSnapshot {
-  return {
-    interface: "meter",
-    connected: true,
-    transport: "tcp",
-    connection: "127.0.0.1:502",
-    unit_id: 1,
-    poll_count: 1,
-    error_count: 0,
-    captured_at_unix_ms: CAPTURED,
-    values,
-    success: true,
   };
 }
 
@@ -311,21 +298,17 @@ describe("resolveValue", () => {
 });
 
 describe("stalenessThresholdMs", () => {
-  it("uses ~3× the register's own interval", () => {
-    expect(stalenessThresholdMs(2, 10)).toBe(6_000);
-  });
-
-  it("falls back to the interface interval when the register inherits", () => {
-    expect(stalenessThresholdMs(null, 4)).toBe(12_000);
+  it("uses ~3× the register's rate", () => {
+    expect(stalenessThresholdMs(2)).toBe(6_000);
   });
 
   it("never drops below 1.5 s", () => {
-    expect(stalenessThresholdMs(0.1, 10)).toBe(1_500);
+    expect(stalenessThresholdMs(0.1)).toBe(1_500);
   });
 
   it("falls back to a fixed cutoff when polling is disabled or nonsense", () => {
-    expect(stalenessThresholdMs(0, 0)).toBe(5_000);
-    expect(stalenessThresholdMs(Number.NaN, Number.NaN)).toBe(5_000);
+    expect(stalenessThresholdMs(0)).toBe(5_000);
+    expect(stalenessThresholdMs(Number.NaN)).toBe(5_000);
   });
 });
 

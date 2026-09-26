@@ -39,14 +39,14 @@ device memory so raw reads round-trip through the client codec.
 
 Pick a capability state with `?mock=<scenario>`:
 
-| Scenario             | What it simulates                                            |
-| -------------------- | ------------------------------------------------------------ |
-| `ready` (default)    | One agent, a mapped TCP interface + a raw-only RTU interface |
-| `extension-missing`  | Agent has no Modbus extension installed                      |
-| `extension-stopped`  | Installed but not running (Start button live)                |
-| `extension-outdated` | 0.1.4-era action set — the required-methods gate trips       |
-| `no-interfaces`      | Running, healthy actions, zero interfaces configured         |
-| `multi-agent`        | One ready agent + one missing the extension                  |
+| Scenario             | What it simulates                                                       |
+| -------------------- | ----------------------------------------------------------------------- |
+| `ready` (default)    | One agent, two mapped units on a TCP connection + a raw-only RTU device |
+| `extension-missing`  | Agent has no Modbus extension installed                                 |
+| `extension-stopped`  | Installed but not running (Start button live)                           |
+| `extension-outdated` | 0.1.x action set (`modbus/*`) — the required-methods gate trips         |
+| `no-devices`         | Running, healthy actions, zero devices configured                       |
+| `multi-agent`        | One ready agent + one missing the extension                             |
 
 The SDK renders a Development Mode banner with theme toggles, applies the Zelos light/dark tokens
 to the document, and toasts follow the resolved host theme.
@@ -87,7 +87,7 @@ don't assume one long-lived React mount across tab switches.
 | Server state             | `src/hooks/*` — TanStack Query, 1 Hz snapshot, 5 s discovery |
 
 All server state goes through TanStack Query. The snapshot key is
-`["modbus-snapshot", agent, interface]`, so every subscriber on one interface shares a single poll.
+`["modbus-snapshot", agent, device]`, so every subscriber on one device shares a single poll.
 
 ## Testing
 

@@ -34,7 +34,7 @@ import {
   type RawWatchRow,
 } from "./watch-store";
 
-/** Staleness cutoff when the effective poll interval is unknown or disabled. */
+/** Staleness cutoff when the poll rate is unknown or disabled. */
 const DEFAULT_STALE_MS = 5_000;
 
 export const TABLE_LABELS: Record<RegisterTableType, string> = {
@@ -44,7 +44,7 @@ export const TABLE_LABELS: Record<RegisterTableType, string> = {
   discrete_input: "discrete",
 };
 
-/** Device documentation writes word order as a byte pattern, and it fits a table
+/** Device documentation writes byte order as a byte pattern, and it fits a table
  *  cell in a way `little_swap` never will. Same permutations as `reorderWords`. */
 export const BYTE_ORDER_LABELS: Record<ByteOrder, string> = {
   big: "AB CD",
@@ -111,7 +111,7 @@ export function resolveValue(
 function pollSupersedes(read: OverlayEntry, polled: { ts_ms: number } | undefined): boolean {
   if (polled === undefined) return false;
   // Nothing was polled when the read happened, so the first sample to arrive is
-  // news — however it is stamped. A register with `poll_interval: 0` never
+  // news — however it is stamped. A register with `rate: 0` never
   // produces one, which is exactly why the read has to hold there forever.
   if (read.supersedes === null) return true;
   // Strictly newer: the same sample the read was taken against is not an update,
@@ -169,13 +169,9 @@ export function sameValueState(a: ValueState, b: ValueState): boolean {
   return true;
 }
 
-/** ~3× the effective poll interval, falling back to 5 s when the interval is
- *  unknown or polling is disabled. */
-export function stalenessThresholdMs(
-  registerPollInterval: number | null,
-  interfacePollInterval: number,
-): number {
-  const seconds = registerPollInterval ?? interfacePollInterval;
+/** ~3× the register's poll rate, falling back to 5 s when the rate is unknown
+ *  or polling is disabled. */
+export function stalenessThresholdMs(seconds: number): number {
   if (!Number.isFinite(seconds) || seconds <= 0) return DEFAULT_STALE_MS;
   return Math.max(3 * seconds * 1000, 1500);
 }
@@ -230,7 +226,7 @@ export function rawWriteModel(row: RawWatchRow): WriteModel {
 
 // ─── Metadata ───────────────────────────────────────────────────────────────
 
-/** The Type cell for a named row: the datatype, annotated with the word order
+/** The Type cell for a named row: the datatype, annotated with the byte order
  *  when it isn't `big` and the scale when it isn't 1 — `int16 ×0.1`. The table
  *  and the unit have their own columns, so neither appears here. */
 export function typeSummary(reg: RegisterEntry): string {
