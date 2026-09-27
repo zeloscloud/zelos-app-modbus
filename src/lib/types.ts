@@ -34,6 +34,7 @@ export const MODBUS_EXTENSION_INSTALL_IDS: ReadonlySet<string> = new Set([
 export const MODBUS_METHODS = {
   listDevices: "list_devices",
   getSnapshot: "get_snapshot",
+  getStatus: "get_status",
   listRegisters: "list_registers",
   readNamedRegister: "read_named_register",
   writeNamedRegister: "write_named_register",
@@ -99,6 +100,10 @@ export const MODBUS_DATATYPES = [
 ] as const;
 export type ModbusDatatype = (typeof MODBUS_DATATYPES)[number];
 
+/** A catalog register's datatype. `string` spans several registers and is
+ *  decoded extension-side only: never raw, never writable. */
+export type RegisterDatatype = ModbusDatatype | "string";
+
 export const BYTE_ORDERS = ["big", "little", "big_swap", "little_swap"] as const;
 export type ByteOrder = (typeof BYTE_ORDERS)[number];
 
@@ -134,7 +139,8 @@ export interface ModbusDeviceEntry extends PollHealth {
   connected: boolean;
   /** Trace path, e.g. `Modbus/10_0_0_5/unit1`; null before the trace is set up. */
   trace_path: string | null;
-  /** Register-map name, or null when the device runs raw-only. */
+  /** Register-map name; null while `map_pending`, after a failed discovery
+   *  (`error`), or when the device runs raw-only. */
   map_name: string | null;
   /** 1 for a device with no map. */
   address_base: AddressBase;
@@ -142,6 +148,9 @@ export interface ModbusDeviceEntry extends PollHealth {
   /** Default requested poll rate in SECONDS. */
   rate: number;
   write_mode: string;
+  /** Raw (address) writes enabled (`advanced.allow_raw_writes`). Raw reads never
+   *  need it. */
+  raw_writes: boolean;
 }
 
 /** One poll tier: the blocks sharing a requested rate. */
@@ -178,6 +187,21 @@ export interface PollHealth {
   demoted: boolean;
   /** Seconds until the next probe while demoted, else null. */
   retry_in_s: number | null;
+  /** Blocks the device refused with an illegal-address exception: not polled,
+   *  retried every 10 min. */
+  refused: RefusedBlock[];
+  /** Why the device is not polling (register map discovery failed), else null. */
+  error: string | null;
+  /** Register map still being discovered (e.g. SunSpec). */
+  map_pending: boolean;
+}
+
+export interface RefusedBlock {
+  /** E.g. `"holding 40001-40010"`, in the map's address base. */
+  range: string;
+  /** Modbus exception code (2 or 3). */
+  code: number;
+  retry_in_s: number;
 }
 
 export interface ListDevicesResult {
@@ -188,13 +212,16 @@ export interface ListDevicesResult {
 
 // ─── Modbus/get_snapshot ────────────────────────────────────────────────────
 
+/** A named register's decoded value; `string` only for a `string` register. */
+export type NamedValue = number | boolean | string | null;
+
 export interface SnapshotValue {
   /** `null` when the polled value isn't representable in JSON: the extension
    *  sanitizes non-finite floats (a NaN or ±Inf straight off the wire — e.g. a
    *  float32 of all ones from an unpopulated sensor) to null at the action
    *  boundary rather than failing the whole snapshot. The poll succeeded; only
    *  the number is unusable. */
-  value: number | boolean | null;
+  value: NamedValue;
   /** Unix epoch ms, agent clock, of the poll that produced this value. */
   ts_ms: number;
 }
@@ -227,7 +254,7 @@ export interface RegisterEntry {
   path: string;
   address: number;
   type: RegisterTableType;
-  datatype: ModbusDatatype;
+  datatype: RegisterDatatype;
   unit: string;
   scale: number;
   description: string;
@@ -242,21 +269,28 @@ export interface ListRegistersResult {
   registers: RegisterEntry[];
   count: number;
   map_name: string | null;
+  success: boolean;
 }
 
 // ─── Named register read/write ──────────────────────────────────────────────
+
+/** A write's result (OPC UA Good/Bad/Uncertain): `unknown` = no response, so the
+ *  write may have landed; read back before retrying. */
+export type WriteOutcome = "ok" | "refused" | "unknown";
 
 /** Decoded + scaled extension-side. `value` is null when the read failed. */
 export interface NamedRegisterResult {
   name: string;
   address: number;
   type: RegisterTableType;
-  datatype: ModbusDatatype;
+  datatype: RegisterDatatype;
   /** `null` alongside `success: true` is a successful read of a value JSON can't
    *  carry — a sanitized non-finite float, exactly as in {@link SnapshotValue}.
    *  It is not a failure, and not the same thing as "never read". */
-  value: number | boolean | null;
+  value: NamedValue;
   unit: string;
+  /** Writes only. */
+  outcome?: WriteOutcome | undefined;
   success: boolean;
 }
 
@@ -276,6 +310,7 @@ export interface WriteSingleRegisterResult {
   value: number;
   /** Always 6 (FC6). */
   function_code: number;
+  outcome: WriteOutcome;
   success: boolean;
 }
 
@@ -285,12 +320,14 @@ export interface WriteRegistersResult {
   count: number;
   /** Always 16 (FC16). */
   function_code: number;
+  outcome: WriteOutcome;
   success: boolean;
 }
 
 export interface WriteCoilResult {
   address: number;
   value: boolean;
+  outcome: WriteOutcome;
   success: boolean;
 }
 
@@ -307,4 +344,6 @@ export interface ModbusActionResult<T = unknown> {
 export interface ModbusErrorPayload {
   error?: string;
   success?: boolean;
+  /** Write actions only. */
+  outcome?: WriteOutcome;
 }

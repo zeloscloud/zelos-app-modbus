@@ -143,9 +143,10 @@ describe("writeDefault", () => {
     expect(writeDefault({ kind: "unrepresentable" })).toBeNull();
   });
 
-  it("offers nothing for a 64-bit integer the editor can't hold", () => {
+  it("offers nothing the numeric editor can't hold: a 64-bit integer, a string", () => {
     const state: ValueState = { kind: "value", value: 2n ** 60n, stale: false, source: "read" };
     expect(writeDefault(state)).toBeNull();
+    expect(writeDefault({ ...state, value: "SN-1234" })).toBeNull();
   });
 });
 
@@ -203,6 +204,11 @@ describe("namedWriteModel", () => {
     expect(namedWriteModel(reg({ type: "holding", writable: false }))).toEqual({
       kind: "readonly",
       why: "this register is marked read-only in the map",
+    });
+    // The extension never encodes a string, whatever the map says.
+    expect(namedWriteModel(reg({ datatype: "string", writable: true }))).toEqual({
+      kind: "readonly",
+      why: "string registers are read-only",
     });
   });
 });

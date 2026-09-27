@@ -31,6 +31,7 @@ import {
   type RawReadResult,
   type RegisterTableType,
   type WriteCoilResult,
+  type WriteOutcome,
   type WriteRegistersResult,
   type WriteSingleRegisterResult,
 } from "./types";
@@ -169,8 +170,15 @@ export class ModbusActionError extends Error {
   readonly status: string | null;
   /** Whatever the agent said about the cause, if it said anything. */
   readonly detail: string | null;
+  /** A failed write's outcome: `unknown` may have landed, `refused` did not. */
+  readonly outcome: WriteOutcome | null;
 
-  constructor(method: string, status: string | null, detail: string | null) {
+  constructor(
+    method: string,
+    status: string | null,
+    detail: string | null,
+    outcome: WriteOutcome | null = null,
+  ) {
     super(
       status === null
         ? `Modbus ${method} failed: ${detail ?? "the extension reported success: false"}`
@@ -180,6 +188,7 @@ export class ModbusActionError extends Error {
     this.method = method;
     this.status = status;
     this.detail = detail;
+    this.outcome = outcome;
   }
 }
 
@@ -210,6 +219,7 @@ function unwrap<T>(res: ModbusActionResult<T>, method: string): T {
         method,
         null,
         typeof payload.error === "string" ? payload.error : null,
+        payload.outcome ?? null,
       );
     }
   }

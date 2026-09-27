@@ -49,6 +49,7 @@ function Harness({ snap }: { snap: ModbusSnapshot }) {
     <RegisterTable
       bridge={BRIDGE}
       writeMode="auto"
+      rawWrites
       agentAddress="localhost:2300"
       deviceName="meter"
       addressBase={1}

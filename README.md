@@ -23,7 +23,8 @@ agent extension (0.2.0+).
 **Add** picks a register out of the map, or starts a **raw row** — any address, with its table,
 datatype and byte order edited inline in the row and committed as you go. Raw rows have no poll
 behind them: they read on demand (`read_register`, decoded client-side) and write FC6 / FC16 / FC5
-by width and table.
+by width and table. Raw writes need the extension's **Allow Raw Writes** (Advanced); off, the Write
+cell says so. A write with no response toasts amber: it may have landed, so read back before retrying.
 
 Values are decoded and encoded by `src/lib/codec.ts`, a 1:1 port of the extension's
 `decode_value` / `encode_value`, so a raw read of a mapped address agrees with that register's named read.

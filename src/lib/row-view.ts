@@ -17,13 +17,14 @@ import {
   isBooleanRegister,
   isRepresentable,
   isWritableTable,
-  type DecodedValue,
+  type DisplayValue,
   type WriteWire,
 } from "./codec";
 import type {
   ByteOrder,
   ModbusDatatype,
   ModbusSnapshot,
+  NamedValue,
   RegisterEntry,
   RegisterTableType,
 } from "./types";
@@ -64,8 +65,7 @@ export type ValueSource = "poll" | "read";
  *  compared with anything: `ts_ms` is agent-clock, and the only other agent-clock
  *  reading available is the snapshot's own `captured_at_unix_ms`. */
 export type ResolvedValue =
-  | { source: "poll"; value: number | boolean | null; ts_ms: number }
-  | { source: "read"; value: number | boolean | null };
+  { source: "poll"; value: NamedValue; ts_ms: number } | { source: "read"; value: NamedValue };
 
 /** A value fetched on demand, and the poll sample it was taken against.
  *
@@ -76,7 +76,7 @@ export type ResolvedValue =
  *  comparing that to agent time was the bug: a browser running behind the agent
  *  would pin the row to its read for as long as the skew lasted. */
 export interface OverlayEntry {
-  value: number | boolean | null;
+  value: NamedValue;
   supersedes: number | null;
 }
 
@@ -90,7 +90,7 @@ export type Overlay = Readonly<Record<string, OverlayEntry>>;
 export type ValueState =
   | { kind: "never" }
   | { kind: "unrepresentable"; context?: string }
-  | { kind: "value"; value: DecodedValue; stale: boolean; source: ValueSource; context?: string };
+  | { kind: "value"; value: DisplayValue; stale: boolean; source: ValueSource; context?: string };
 
 /** The on-demand read, until the poll produces something newer than the sample
  *  that read was taken against. */
@@ -148,10 +148,11 @@ export function rawValueState(readout: RawReadout | null): ValueState {
 }
 
 /** The value the write editor may offer as its placeholder. Nothing the user
- *  can't retype belongs there: no missing sample, no unrepresentable one, and no
- *  64-bit integer (the editor works in `number`). */
+ *  can't retype belongs there: no missing sample, no unrepresentable one, no
+ *  64-bit integer (the editor works in `number`), and no string. */
 export function writeDefault(state: ValueState): number | boolean | null {
   if (state.kind !== "value" || typeof state.value === "bigint") return null;
+  if (typeof state.value === "string") return null;
   return state.value;
 }
 
@@ -185,6 +186,8 @@ function isStale(ts_ms: number, thresholdMs: number, snapshotCapturedAt: number 
 
 // ─── Write ──────────────────────────────────────────────────────────────────
 
+export const STRING_READ_ONLY_REASON = "string registers are read-only";
+
 /** What the Write cell offers for a row, and what to validate against.
  *
  *  `blind` is the honest state when the catalog is unreachable: a named write only
@@ -197,6 +200,8 @@ export type WriteModel =
   | { kind: "blind" };
 
 export function namedWriteModel(reg: RegisterEntry): WriteModel {
+  // The extension refuses to encode a string, whatever the map says.
+  if (reg.datatype === "string") return { kind: "readonly", why: STRING_READ_ONLY_REASON };
   if (!reg.writable) {
     // Two different facts, two different fixes: the protocol forbids writing this
     // table, or the map marks this particular register read-only.

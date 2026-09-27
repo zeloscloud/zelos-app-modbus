@@ -8,7 +8,7 @@ import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { DevicePanel } from "../DevicePanel";
+import { DevicePanel, mapState, type MapState } from "../DevicePanel";
 import { useWatchRows } from "@/hooks/use-watch-rows";
 import { listDevices } from "@/lib/modbus-bridge";
 import type { ModbusDeviceEntry, ModbusSnapshot } from "@/lib/types";
@@ -150,13 +150,13 @@ describe("DevicePanel rows section", () => {
     await screen.findByText(/No rows yet/);
 
     await openDialog();
-    fireEvent.click(dialogOption("total"));
+    fireEvent.click(dialogOption("voltage_high_limit"));
     await dialogClosed();
     await openDialog();
-    fireEvent.click(dialogOption("total"));
+    fireEvent.click(dialogOption("voltage_high_limit"));
     await dialogClosed();
 
-    const inputs = await screen.findAllByLabelText("New value for power/total");
+    const inputs = await screen.findAllByLabelText("New value for setpoints/voltage_high_limit");
     expect(inputs).toHaveLength(2);
 
     // Each row latches its own value, and each survives a reload.
@@ -266,12 +266,36 @@ describe("DevicePanel rows section", () => {
       achieved_rate: 2.5,
       overload_pct: 150,
       failed_reads: 3,
+      refused: [{ range: "holding 40001-40010", code: 2, retry_in_s: 539.4 }],
     };
     await renderPanel({ wrap: (b) => intercept(b, { snapshot }) });
 
     expect(await screen.findByText("demoted, retry in 20s")).toBeInTheDocument();
+    expect(screen.getByText("1 block refused")).toBeInTheDocument();
+    expect(
+      screen.getByText("holding 40001-40010 refused (exception 02), retry in 540s"),
+    ).toBeInTheDocument();
     expect(screen.getByText("rate 1s (achieved 2.5s)")).toHaveClass("text-amber-600");
     expect(screen.getByText("failed 3")).toHaveClass("text-amber-600");
+  });
+
+  const map = { map_name: null, map_pending: false, error: null };
+  it.each<[string, Parameters<typeof mapState>[0], Parameters<typeof mapState>[1], MapState]>([
+    ["mapped", { ...map, map_name: "m" }, undefined, { kind: "mapped", name: "m" }],
+    ["raw only", map, map, { kind: "raw" }],
+    ["discovering", { ...map, map_pending: true }, undefined, { kind: "pending" }],
+    // The snapshot calls it done; list_devices has yet to name the map.
+    ["pending until named", { ...map, map_pending: true }, map, { kind: "pending" }],
+    [
+      "failed, while retrying",
+      map,
+      { map_pending: true, error: "boom" },
+      { kind: "failed", error: "boom" },
+    ],
+    // The fresher snapshot clears a stale list_devices error.
+    ["recovered", { ...map, error: "boom" }, map, { kind: "raw" }],
+  ])("reads the register map as %s", (_, device, snapshot, expected) => {
+    expect(mapState(device, snapshot)).toEqual(expected);
   });
 
   it("shows disconnected instead of a rate while the link is down", async () => {

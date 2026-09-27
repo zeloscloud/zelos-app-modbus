@@ -37,6 +37,10 @@ import { errorMessage } from "./utils";
 /** A value decoded off the wire. `bigint` only for unscaled 64-bit integers. */
 export type DecodedValue = number | boolean | bigint;
 
+/** What a Value cell can print: a decoded value, or a named `string` register's
+ *  text, which only the extension decodes. */
+export type DisplayValue = DecodedValue | string;
+
 /** Number of 16-bit words each datatype occupies. */
 export const WORD_COUNTS: Readonly<Record<ModbusDatatype, number>> = {
   bool: 1,
@@ -283,10 +287,11 @@ const INTEGER_DATATYPES: ReadonlySet<ModbusDatatype> = new Set<ModbusDatatype>([
 
 const SIXTY_FOUR_BIT: ReadonlySet<ModbusDatatype> = new Set<ModbusDatatype>(["uint64", "int64"]);
 
-/** How far off a whole raw count a scaled draft may land before we call it
- *  fractional. Dividing by a decimal scale is inexact in binary floating point —
- *  `100.5 / 0.1` is `1004.9999999999999` — so the test has to be a tolerance, not
- *  an equality. */
+/** How far off a whole raw count a scaled draft may land, in raw counts, before
+ *  we call it fractional: an absolute floor plus a few ULPs of the quotient.
+ *  `100.5 / 0.1` is `1004.9999999999999`, so the test can't be an equality, but
+ *  it must not grow with magnitude either (uint32 `1000000000.4` is fractional).
+ *  Matches the extension's `encode_register` check. */
 const STEP_TOLERANCE = 1e-9;
 
 /** Largest integer JSON can carry without losing a digit. */
@@ -341,9 +346,11 @@ export function parseWriteDraft(
 function stepError(value: number, datatype: ModbusDatatype, scale: number): string | null {
   if (!INTEGER_DATATYPES.has(datatype)) return null;
   const divisor = scale !== 0 && Number.isFinite(scale) ? scale : 1;
-  const raw = value / divisor;
-  const nearest = Math.round(raw);
-  if (Math.abs(raw - nearest) <= STEP_TOLERANCE * Math.max(1, Math.abs(raw))) return null;
+  const q = value / divisor;
+  const nearest = Math.round(q);
+  if (Math.abs(q - nearest) <= Math.max(STEP_TOLERANCE, 4 * Number.EPSILON * Math.abs(q))) {
+    return null;
+  }
   const writable = nearest * divisor;
   return `${formatDecodedValue(value)} is not a whole ${datatype} step; nearest writable value is ${formatDecodedValue(writable)}`;
 }
@@ -390,14 +397,15 @@ export function parseAddress(input: string, base: AddressBase): number | null {
  *  what the extension sends when a value isn't JSON-representable, and a
  *  non-finite number, which is what a client-side decode of the same words
  *  produces. Neither is a missing sample — the read happened. */
-export function isRepresentable(value: DecodedValue | null): value is DecodedValue {
+export function isRepresentable(value: DisplayValue | null): value is DisplayValue {
   return value !== null && (typeof value !== "number" || Number.isFinite(value));
 }
 
 /** Display form for a decoded value. Booleans read as ON/OFF (the wire idiom
  *  for coils); 64-bit integers stay strings so nothing is rounded on the way
- *  to the DOM. */
-export function formatDecodedValue(value: DecodedValue): string {
+ *  to the DOM; string registers print as-is. */
+export function formatDecodedValue(value: DisplayValue): string {
+  if (typeof value === "string") return value;
   if (typeof value === "boolean") return value ? "ON" : "OFF";
   if (typeof value === "bigint") return value.toString();
   if (!Number.isFinite(value)) return String(value);

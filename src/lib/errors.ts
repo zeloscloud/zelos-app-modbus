@@ -39,8 +39,13 @@ function unframe(raw: string): string | null {
   return null;
 }
 
+/** What an unanswered write tells the user. */
+export const WRITE_UNKNOWN_MESSAGE =
+  "No response; the write may have landed; read back before retrying.";
+
 /** Toast + console a failed action. `debug` is copied verbatim (as JSON) when
- *  the user clicks "Copy details", so put the whole request context in it. */
+ *  the user clicks "Copy details", so put the whole request context in it. A
+ *  write with an unknown outcome toasts amber, not red: it may have landed. */
 export function reportActionFailure(
   label: string,
   error: unknown,
@@ -52,13 +57,22 @@ export function reportActionFailure(
     error: errorMessage(error),
     // A typed failure carries its pieces, so a bug report gets them unflattened.
     ...(error instanceof ModbusActionError
-      ? { action: { method: error.method, status: error.status, detail: error.detail } }
+      ? {
+          action: {
+            method: error.method,
+            status: error.status,
+            detail: error.detail,
+            outcome: error.outcome,
+          },
+        }
       : {}),
   };
   // Deliberate developer escape hatch: the toast is truncated, the console isn't.
   console.error("[MODBUS] action failed", payload);
-  toast.error(`${label} failed`, {
-    description: humanizeActionError(error),
+  const unknown = error instanceof ModbusActionError && error.outcome === "unknown";
+  const notify = unknown ? toast.warning : toast.error;
+  notify(unknown ? `${label}: no response` : `${label} failed`, {
+    description: unknown ? WRITE_UNKNOWN_MESSAGE : humanizeActionError(error),
     duration: 10000,
     action: {
       label: "Copy details",

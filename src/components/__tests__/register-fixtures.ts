@@ -51,6 +51,9 @@ export function snapshot(
     failed_reads: 0,
     demoted: false,
     retry_in_s: null,
+    refused: [],
+    error: null,
+    map_pending: false,
     values,
     success: true,
   };
@@ -79,7 +82,11 @@ export function deviceEntry(overrides: Partial<ModbusDeviceEntry> = {}): ModbusD
     failed_reads: 0,
     demoted: false,
     retry_in_s: null,
+    refused: [],
+    error: null,
+    map_pending: false,
     write_mode: "auto",
+    raw_writes: true,
     ...overrides,
   };
 }

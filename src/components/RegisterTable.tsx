@@ -85,6 +85,7 @@ import {
   type AddressBase,
   type ModbusDatatype,
   type ModbusSnapshot,
+  type NamedValue,
   type RegisterEntry,
   type RegisterTableType,
 } from "@/lib/types";
@@ -110,6 +111,9 @@ const FLASH_MS = 500;
 /** What the cell says instead of a number the wire couldn't carry. */
 const UNREPRESENTABLE_TITLE = "device returned a non-finite value (NaN/Inf)";
 
+/** Why a raw row has no write control. */
+const RAW_WRITES_OFF = "raw writes are off (Modbus extension: Advanced > Allow Raw Writes)";
+
 /** Shared array identity, so a hint prop can't defeat the row memo. */
 const NOT_POLLED: readonly string[] = ["not polled"];
 
@@ -121,6 +125,8 @@ export interface RegisterTableProps {
   addressBase: AddressBase;
   /** The device's `write_mode`; `fc16` sends a one-word raw write as FC16. */
   writeMode: string;
+  /** The device's `raw_writes`: false disables every raw row's write control. */
+  rawWrites: boolean;
   /** The device's catalog. Named rows join against it by path; nothing about a
    *  register is ever copied into a stored row. Empty for a raw-only device. */
   registers: readonly RegisterEntry[];
@@ -144,6 +150,7 @@ export function RegisterTable({
   deviceName,
   addressBase,
   writeMode,
+  rawWrites,
   registers,
   rows,
   catalogReady,
@@ -161,7 +168,7 @@ export function RegisterTable({
   const snapshotRef = React.useRef(snapshot);
   snapshotRef.current = snapshot;
 
-  const handleOverlay = React.useCallback((path: string, value: number | boolean | null) => {
+  const handleOverlay = React.useCallback((path: string, value: NamedValue) => {
     // Remember which poll sample this read overtook, in the agent's clock, so
     // the poll can take the row back the moment it reports a newer one.
     const supersedes = snapshotRef.current?.values[path]?.ts_ms ?? null;
@@ -220,6 +227,7 @@ export function RegisterTable({
                   deviceName={deviceName}
                   addressBase={addressBase}
                   writeMode={writeMode}
+                  rawWrites={rawWrites}
                   row={row}
                   onUpdateRow={onUpdateRow}
                   onRemoveRow={onRemoveRow}
@@ -267,7 +275,7 @@ interface NamedRowProps {
   reg: RegisterEntry | null;
   row: NamedWatchRow;
   state: ValueState;
-  onValueRead: (path: string, value: number | boolean | null) => void;
+  onValueRead: (path: string, value: NamedValue) => void;
   onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
 }
@@ -311,7 +319,7 @@ function NamedRegisterRowView({
    *  success signal — no label, no toast, no reflow. A `null` value is a landed
    *  read too (the device answered with a non-finite float), so it flashes like
    *  any other; the cell says what it can't show. */
-  function acceptRead(value: number | boolean | null) {
+  function acceptRead(value: NamedValue) {
     onValueRead(path, value);
     flashNow();
   }
@@ -395,6 +403,7 @@ interface RawRowProps {
   deviceName: string;
   addressBase: AddressBase;
   writeMode: string;
+  rawWrites: boolean;
   row: RawWatchRow;
   onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
@@ -406,6 +415,7 @@ function RawRegisterRowView({
   deviceName,
   addressBase,
   writeMode,
+  rawWrites,
   row,
   onUpdateRow,
   onRemoveRow,
@@ -560,15 +570,19 @@ function RawRegisterRowView({
         onRead={() => run("read", performRead)}
         readLabel={`Read ${label} from the device now`}
       />
-      <WriteCell
-        model={rawWriteModel(row)}
-        state={state}
-        label={label}
-        busy={blocked}
-        initialDraft={row.draft ?? ""}
-        onDraftChange={(draft) => patch({ draft })}
-        onWrite={handleWrite}
-      />
+      {rawWrites || !isWritableTable(row.table) ? (
+        <WriteCell
+          model={rawWriteModel(row)}
+          state={state}
+          label={label}
+          busy={blocked}
+          initialDraft={row.draft ?? ""}
+          onDraftChange={(draft) => patch({ draft })}
+          onWrite={handleWrite}
+        />
+      ) : (
+        <Td className="text-[10px] text-muted-foreground">{RAW_WRITES_OFF}</Td>
+      )}
       <Td>
         <RemoveButton label={label} disabled={busy !== null} onRemove={() => onRemoveRow(row.id)} />
       </Td>

@@ -517,6 +517,8 @@ describe("parseWriteDraft", () => {
     // Naming the value that WOULD be written is the point: 1.9 becomes 2.
     expect(error).toBe("1.9 is not a whole uint16 step; nearest writable value is 2");
     expect(parseWriteDraft("-2.5", "int16", 1).error).toMatch(/nearest writable value is -2/);
+    // No magnitude-relative slack: 0.4 of a count is still a fraction.
+    expect(parseWriteDraft("1000000000.4", "uint32", 1).error).toMatch(/not a whole uint32 step/);
   });
 
   it("keeps a fraction the scale makes whole", () => {
@@ -596,6 +598,7 @@ describe("formatters", () => {
     expect(formatDecodedValue(false)).toBe("OFF");
     expect(formatDecodedValue(100)).toBe("100");
     expect(formatDecodedValue(18446744073709551615n)).toBe("18446744073709551615");
+    expect(formatDecodedValue("SN-1234")).toBe("SN-1234");
     // float32 noise is trimmed rather than rendered in full.
     expect(formatDecodedValue(decodeValue([0x4048, 0xf5c3], "float32") as number)).toBe("3.14");
   });

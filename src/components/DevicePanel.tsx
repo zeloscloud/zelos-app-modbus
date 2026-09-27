@@ -3,7 +3,8 @@
  *  addresses side by side, in insertion order.
  *
  *  A device with no register map (`map_name === null`) is not a special case
- *  any more: its catalog is simply empty, so only raw rows can be added to it. */
+ *  any more: its catalog is simply empty, so only raw rows can be added to it.
+ *  A map still being discovered, or whose discovery failed, is not "no map". */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { AlertCircle, Loader2, Plus } from "lucide-react";
@@ -72,8 +73,10 @@ export function DevicePanel({
   // A device with no map has nothing to join against and never will, so a
   // named row on it really is orphaned. A catalog that failed to load says
   // nothing about any row — those rows keep working on their paths alone.
-  const catalogReady = device.map_name === null || registersQuery.isSuccess;
+  const map = mapState(device, snapshot);
+  const catalogReady = map.kind === "raw" || registersQuery.isSuccess;
   const retryCatalog = registersQuery.refetch;
+  const refused = (snapshot ?? device).refused;
 
   const openPicker = React.useCallback(() => setPickerOpen(true), []);
   const addRegister = React.useCallback(
@@ -110,10 +113,24 @@ export function DevicePanel({
               {snapshot.retry_in_s !== null && `, retry in ${Math.ceil(snapshot.retry_in_s)}s`}
             </Badge>
           )}
-          {device.map_name !== null ? (
-            <span className="text-muted-foreground">map {device.map_name}</span>
-          ) : (
-            <Badge variant="warning">raw only</Badge>
+          {map.kind === "mapped" && <span className="text-muted-foreground">map {map.name}</span>}
+          {map.kind === "raw" && <Badge variant="warning">raw only</Badge>}
+          {map.kind === "pending" && (
+            <Badge variant="warning" className="gap-1">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              discovering register map
+            </Badge>
+          )}
+          {map.kind === "failed" && (
+            <Badge variant="destructive" className="gap-1">
+              <AlertCircle className="h-3 w-3" />
+              map discovery failed
+            </Badge>
+          )}
+          {refused.length > 0 && (
+            <Badge variant="warning">
+              {refused.length} {refused.length === 1 ? "block" : "blocks"} refused
+            </Badge>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[11px] text-muted-foreground">
@@ -132,6 +149,13 @@ export function DevicePanel({
           <span>{device.register_count} regs</span>
         </div>
         {snapshotError && <p className="text-[11px] text-destructive">{snapshotError.message}</p>}
+        {map.kind === "failed" && <p className="text-[11px] text-destructive">{map.error}</p>}
+        {refused.map((b) => (
+          <p key={b.range} className="font-mono text-[11px] text-amber-600 dark:text-amber-400">
+            {b.range} refused (exception {formatExceptionCode(b.code)}), retry in{" "}
+            {Math.ceil(b.retry_in_s)}s
+          </p>
+        ))}
       </div>
 
       {/* The blurb + Add button, the table, and the dialog that feeds it. The
@@ -180,6 +204,7 @@ export function DevicePanel({
               deviceName={device.name}
               addressBase={device.address_base}
               writeMode={device.write_mode}
+              rawWrites={device.raw_writes}
               registers={registers}
               rows={rows}
               catalogReady={catalogReady}
@@ -203,6 +228,34 @@ export function DevicePanel({
       </div>
     </div>
   );
+}
+
+export type MapState =
+  | { kind: "mapped"; name: string }
+  | { kind: "raw" }
+  | { kind: "pending" }
+  | { kind: "failed"; error: string };
+
+type MapFields = Pick<PollHealth, "map_pending" | "error">;
+
+/** What the device's register map is doing. The 1 Hz snapshot is fresher than
+ *  `list_devices` for pending/error; `map_name` only comes from the latter, so a
+ *  map the snapshot calls done stays pending until `list_devices` names it. A
+ *  failed discovery is retried (still pending) but reads as failed. */
+export function mapState(
+  device: MapFields & { map_name: string | null },
+  snapshot: MapFields | undefined,
+): MapState {
+  if (device.map_name !== null) return { kind: "mapped", name: device.map_name };
+  const live = snapshot ?? device;
+  if (live.error !== null) return { kind: "failed", error: live.error };
+  if (live.map_pending || device.map_pending) return { kind: "pending" };
+  return { kind: "raw" };
+}
+
+/** `2` → `"02"`, as the extension logs it. */
+function formatExceptionCode(code: number): string {
+  return code.toString(16).toUpperCase().padStart(2, "0");
 }
 
 /** Requested vs measured poll rate of the device's worst tier. */

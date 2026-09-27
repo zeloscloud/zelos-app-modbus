@@ -114,7 +114,7 @@ describe("register catalog", () => {
     expect(map_name).toBe("power_meter");
 
     const l1 = registers.find((r) => r.path === "voltage/L1");
-    expect(l1).toMatchObject({ event: "voltage", datatype: "float32", unit: "V", writable: true });
+    expect(l1).toMatchObject({ event: "voltage", datatype: "float32", unit: "V", writable: false });
 
     const temperature = registers.find((r) => r.path === "status/temperature");
     expect(temperature?.scale).toBe(0.1);
@@ -177,14 +177,6 @@ describe("named read/write", () => {
     expect(snapshot.values["setpoints/voltage_high_limit"]?.value).toBe(249);
   });
 
-  it("round-trips a scaled int16", async () => {
-    const bridge = makeHost("ready");
-    // temperature is int16 × 0.1: 23.5 °C stores raw 235.
-    await writeNamedRegister(bridge, AGENT, METER, "status/temperature", 23.5);
-    const res = await readNamedRegister(bridge, AGENT, METER, "status/temperature");
-    expect(res.value).toBe(23.5);
-  });
-
   it("writes a coil through the named path", async () => {
     const bridge = makeHost("ready");
     await writeNamedRegister(bridge, AGENT, METER, "status/relay2", 1);
@@ -195,7 +187,7 @@ describe("named read/write", () => {
     const bridge = makeHost("ready");
     await expect(
       writeNamedRegister(bridge, AGENT, METER, "inputs/firmware_version", 1),
-    ).rejects.toThrow(/not writable/);
+    ).rejects.toMatchObject({ message: /read-only/, outcome: "refused" });
   });
 
   it("rejects an unknown device and an unknown register", async () => {
@@ -252,10 +244,10 @@ describe("raw access", () => {
 
   it("writes multiple words with FC16 (comma-separated wire format)", async () => {
     const bridge = makeHost("ready");
-    const res = await writeRegisters(bridge, AGENT, METER, 111, [0xf5c3, 0x4048]);
-    expect(res).toMatchObject({ count: 2, function_code: 16 });
+    const res = await writeRegisters(bridge, AGENT, METER, 113, [0xf5c3, 0x4048]);
+    expect(res).toMatchObject({ count: 2, function_code: 16, outcome: "ok" });
     const back = await readRegister(bridge, AGENT, METER, {
-      address: 111,
+      address: 113,
       reg_type: "holding",
       count: 2,
     });
@@ -276,6 +268,18 @@ describe("raw access", () => {
       count: 1,
     });
     expect(back.values).toEqual([true]);
+  });
+
+  it("refuses raw writes the device has off, or onto a read-only mapped register", async () => {
+    const bridge = makeHost("ready");
+    await expect(writeSingleRegister(bridge, AGENT, UNIT2, 300, 1)).rejects.toMatchObject({
+      message: /Raw writes are disabled/,
+      outcome: "refused",
+    });
+    // 111-112 is calibration_factor, which the map leaves read-only.
+    await expect(writeRegisters(bridge, AGENT, METER, 110, [1, 2])).rejects.toThrow(
+      /Address 111 is read-only in the device map \(swapped_floats\/calibration_factor\)/,
+    );
   });
 
   it("rejects a read the extension would refuse", async () => {

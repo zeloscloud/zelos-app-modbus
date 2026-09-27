@@ -102,6 +102,8 @@ interface RegisterDef {
   description?: string;
   /** Seconds; unset polls at the meter's default (1 s), `0` never polls. */
   rate?: number;
+  /** Maps are read-only unless a register opts in, as in the extension. */
+  writable?: boolean;
   /** Seed physical value written into device memory at boot. */
   seed?: number | boolean;
   /** Measurement registers get re-seeded on every tick; config ones don't, so
@@ -164,14 +166,15 @@ const REGISTER_DEFS: RegisterDef[] = [
     // Seeded straight into memory as 0xffff 0xffff (see buildMeter): there is no
     // physical value to encode, which is the whole point of this register.
   },
-  { event: "status", name: "relay1", address: 0, type: "coil", seed: true },
-  { event: "status", name: "relay2", address: 1, type: "coil", seed: false },
+  { event: "status", name: "relay1", address: 0, type: "coil", writable: true, seed: true },
+  { event: "status", name: "relay2", address: 1, type: "coil", writable: true, seed: false },
   {
     event: "status",
     name: "alarm",
     address: 2,
     type: "coil",
     description: "Latched fault relay — clear it by writing OFF",
+    writable: true,
     seed: false,
   },
   // Static identity: the slow (60 s) poll tier.
@@ -207,14 +210,29 @@ const REGISTER_DEFS: RegisterDef[] = [
     type: "discrete_input",
     seed: true,
   },
-  { event: "setpoints", name: "voltage_high_limit", address: 100, unit: "V", seed: 253 },
-  { event: "setpoints", name: "voltage_low_limit", address: 101, unit: "V", seed: 207 },
+  {
+    event: "setpoints",
+    name: "voltage_high_limit",
+    address: 100,
+    unit: "V",
+    writable: true,
+    seed: 253,
+  },
+  {
+    event: "setpoints",
+    name: "voltage_low_limit",
+    address: 101,
+    unit: "V",
+    writable: true,
+    seed: 207,
+  },
   {
     event: "setpoints",
     name: "power_limit",
     address: 102,
     datatype: "int32",
     unit: "W",
+    writable: true,
     seed: 5_000,
   },
   {
@@ -224,6 +242,7 @@ const REGISTER_DEFS: RegisterDef[] = [
     datatype: "uint32",
     description: "Write any value to clear the energy counter; never polled",
     rate: 0,
+    writable: true,
     seed: 0,
   },
   {
@@ -240,6 +259,7 @@ const REGISTER_DEFS: RegisterDef[] = [
     address: 112,
     datatype: "float32",
     byte_order: "big_swap",
+    writable: true,
     seed: -0.75,
   },
 ];
@@ -260,7 +280,7 @@ function phase(
   }));
 }
 
-function toEntry(def: RegisterDef, base: AddressBase): RegisterEntry {
+function toEntry(def: RegisterDef, base: AddressBase): SimRegister {
   const type = def.type ?? "holding";
   return {
     name: def.name,
@@ -274,13 +294,16 @@ function toEntry(def: RegisterDef, base: AddressBase): RegisterEntry {
     description: def.description ?? "",
     // Input registers and discrete inputs are read-only per the Modbus spec,
     // and the extension's Register dataclass forces that too.
-    writable: type !== "input" && type !== "discrete_input",
+    writable: def.writable === true && type !== "input" && type !== "discrete_input",
     byte_order: def.byte_order ?? "big",
     rate: def.rate ?? 1,
   };
 }
 
 // ─── Simulator state ───────────────────────────────────────────────────────
+
+/** The simulated map has no `string` registers, so its memory codec applies. */
+type SimRegister = RegisterEntry & { datatype: ModbusDatatype };
 
 interface Memory {
   holding: Map<number, number>;
@@ -292,7 +315,7 @@ interface Memory {
 interface SimDevice {
   entry: ModbusDeviceEntry;
   defs: RegisterDef[];
-  registers: RegisterEntry[];
+  registers: SimRegister[];
   memory: Memory;
   /** Last-polled cache — exactly what get_snapshot serves, `null` values and
    *  all. */
@@ -334,6 +357,9 @@ function deviceEntry(
     | "connected"
     | "successful_reads"
     | "failed_reads"
+    | "refused"
+    | "error"
+    | "map_pending"
   >,
 ): ModbusDeviceEntry {
   const name = `${connection}/${device}`;
@@ -345,12 +371,15 @@ function deviceEntry(
     trace_path: `Modbus/${name}`,
     successful_reads: 0,
     failed_reads: 0,
+    refused: [],
+    error: null,
+    map_pending: false,
     ...fields,
   };
 }
 
 /** A power meter on the shared TCP connection; each unit has its own memory. */
-function buildMeter(unitId: number, base: AddressBase): SimDevice {
+function buildMeter(unitId: number, base: AddressBase, rawWrites: boolean): SimDevice {
   const registers = REGISTER_DEFS.map((def) => toEntry(def, base));
   const dev: SimDevice = {
     entry: deviceEntry("meter_panel", `unit${unitId}`, {
@@ -362,6 +391,7 @@ function buildMeter(unitId: number, base: AddressBase): SimDevice {
       register_count: registers.length,
       rate: 1,
       write_mode: "auto",
+      raw_writes: rawWrites,
       // Headline = the worst tier: the slow one lags more.
       requested_rate: 60,
       achieved_rate: 63,
@@ -409,6 +439,8 @@ function buildProbe(): SimDevice {
       register_count: 0,
       rate: 2,
       write_mode: "fc16",
+      // Raw-only, so raw writes are the only writes it has.
+      raw_writes: true,
       // No registers, so nothing is polled.
       requested_rate: null,
       achieved_rate: null,
@@ -434,7 +466,9 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
     actionSet: "full",
     actionsReadyAt: null,
     devices: new Map(
-      [buildMeter(1, 1), buildMeter(2, 0), buildProbe()].map((d) => [d.entry.name, d] as const),
+      [buildMeter(1, 1, true), buildMeter(2, 0, false), buildProbe()].map(
+        (d) => [d.entry.name, d] as const,
+      ),
     ),
   });
 
@@ -475,7 +509,7 @@ function addressRangeError(dev: SimDevice, address: unknown): string {
   return `Address ${String(address)} out of range ${base}…${maxAddress(base)}`;
 }
 
-function writeMemory(dev: SimDevice, reg: RegisterEntry, value: number | boolean): void {
+function writeMemory(dev: SimDevice, reg: SimRegister, value: number | boolean): void {
   const { memory } = dev;
   const wire = reg.address - dev.entry.address_base;
   if (isBitTable(reg.type)) {
@@ -492,7 +526,7 @@ function writeMemory(dev: SimDevice, reg: RegisterEntry, value: number | boolean
  *  then sanitize it the way the extension's action boundary does: a non-finite
  *  float (an unpopulated sensor reading 0xffff 0xffff, say) has no JSON form, so
  *  it goes over the wire as `null` rather than failing the whole action. */
-function readMemory(dev: SimDevice, reg: RegisterEntry): number | boolean | null {
+function readMemory(dev: SimDevice, reg: SimRegister): number | boolean | null {
   const { memory } = dev;
   const wire = reg.address - dev.entry.address_base;
   if (isBitTable(reg.type)) {
@@ -665,8 +699,35 @@ function failure(error: string) {
   return { status: "done", result: { error, success: false } };
 }
 
+/** A write the extension refused before sending anything. */
+function refused(error: string) {
+  return { status: "done", result: { error, outcome: "refused", success: false } };
+}
+
 function done<T extends object>(result: T) {
   return { status: "done", result: { ...result, success: true } };
+}
+
+/** The extension's raw-write gate: `allow_raw_writes`, then no read-only
+ *  register of `table` inside `wire .. wire + count`. */
+function rawWriteRefusal(
+  dev: SimDevice,
+  table: RegisterTableType,
+  wire: number,
+  count: number,
+): string | null {
+  if (!dev.entry.raw_writes) {
+    return "Raw writes are disabled (advanced.allow_raw_writes); write a register the device map marks writable by name instead";
+  }
+  const base = dev.entry.address_base;
+  const hit = dev.registers.find((r) => {
+    const start = r.address - base;
+    const span = isBitTable(r.type) ? 1 : wordCount(r.datatype);
+    return r.type === table && !r.writable && start < wire + count && wire < start + span;
+  });
+  return hit === undefined
+    ? null
+    : `Address ${hit.address} is read-only in the device map (${hit.path})`;
 }
 
 async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unknown) {
@@ -717,6 +778,9 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
           tiers: dev.entry.tiers,
           demoted: dev.entry.demoted,
           retry_in_s: dev.entry.retry_in_s,
+          refused: dev.entry.refused,
+          error: dev.entry.error,
+          map_pending: dev.entry.map_pending,
           captured_at_unix_ms: Date.now(),
           values,
           success: true,
@@ -731,6 +795,7 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
           registers: dev.registers,
           count: dev.registers.length,
           map_name: dev.entry.map_name,
+          success: true,
         },
       };
 
@@ -750,12 +815,14 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
 
     case MODBUS_METHODS.writeNamedRegister: {
       const reg = findRegister(dev, args.name);
-      if (!reg) return failure(`Register '${String(args.name)}' not found`);
+      if (!reg) return refused(`Register '${String(args.name)}' not found`);
       if (!reg.writable) {
-        return failure(`Register '${reg.path}' is not writable (type: ${reg.type})`);
+        return refused(
+          `Register '${reg.path}' is read-only (the device map does not mark it writable)`,
+        );
       }
       const value = Number(args.value);
-      if (!Number.isFinite(value)) return failure(`Value '${String(args.value)}' is not a number`);
+      if (!Number.isFinite(value)) return refused(`Value '${String(args.value)}' is not a number`);
       writeMemory(dev, reg, isBitTable(reg.type) ? value !== 0 : value);
       // Polled registers show the new value on the next sweep; refresh the cache
       // immediately for the ones that are polled so the UI feels live.
@@ -769,6 +836,7 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
         datatype: reg.datatype,
         value,
         unit: reg.unit,
+        outcome: "ok",
       });
     }
 
@@ -801,12 +869,14 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
       const address = Number(args.address);
       const value = Number(args.value);
       if (!Number.isInteger(address) || !Number.isFinite(value)) {
-        return failure("write_single_register needs an integer address and numeric value");
+        return refused("write_single_register needs an integer address and numeric value");
       }
       const wire = toWire(dev, address);
-      if (wire === null) return failure(addressRangeError(dev, args.address));
+      if (wire === null) return refused(addressRangeError(dev, args.address));
+      const gate = rawWriteRefusal(dev, "holding", wire, 1);
+      if (gate !== null) return refused(gate);
       dev.memory.holding.set(wire, Math.trunc(value) & 0xffff);
-      return { status: "done", result: { address, value, function_code: 6, success: true } };
+      return done({ address, value, function_code: 6, outcome: "ok" });
     }
 
     case MODBUS_METHODS.writeRegisters: {
@@ -819,31 +889,32 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
         /^[+-]?\d+$/.test(v) ? Number.parseInt(v, 10) : Number.NaN,
       );
       if (!Number.isInteger(address) || parsed.some((v) => !Number.isInteger(v))) {
-        return failure("Values must be comma-separated integers");
+        return refused("Values must be comma-separated integers");
       }
       const wire = toWire(dev, address, parsed.length);
-      if (wire === null) return failure(addressRangeError(dev, args.address));
+      if (wire === null) return refused(addressRangeError(dev, args.address));
+      const gate = rawWriteRefusal(dev, "holding", wire, parsed.length);
+      if (gate !== null) return refused(gate);
       parsed.forEach((word, i) => dev.memory.holding.set(wire + i, word & 0xffff));
-      return {
-        status: "done",
-        result: {
-          address,
-          values: parsed,
-          count: parsed.length,
-          function_code: 16,
-          success: true,
-        },
-      };
+      return done({
+        address,
+        values: parsed,
+        count: parsed.length,
+        function_code: 16,
+        outcome: "ok",
+      });
     }
 
     case MODBUS_METHODS.writeCoil: {
       const address = Number(args.address);
-      if (!Number.isInteger(address)) return failure("write_coil needs an integer address");
+      if (!Number.isInteger(address)) return refused("write_coil needs an integer address");
       const wire = toWire(dev, address);
-      if (wire === null) return failure(addressRangeError(dev, args.address));
+      if (wire === null) return refused(addressRangeError(dev, args.address));
+      const gate = rawWriteRefusal(dev, "coil", wire, 1);
+      if (gate !== null) return refused(gate);
       const on = args.value === "ON";
       dev.memory.coil.set(wire, on);
-      return { status: "done", result: { address, value: on, success: true } };
+      return done({ address, value: on, outcome: "ok" });
     }
 
     default:
@@ -851,7 +922,7 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
   }
 }
 
-function findRegister(dev: SimDevice, name: unknown): RegisterEntry | undefined {
+function findRegister(dev: SimDevice, name: unknown): SimRegister | undefined {
   if (typeof name !== "string") return undefined;
   return dev.registers.find((r) => r.path === name || r.name === name);
 }
