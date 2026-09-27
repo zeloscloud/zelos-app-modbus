@@ -63,6 +63,19 @@ export function AgentPanel({
           )}
         </div>
 
+        {agent.ambiguousInstalls && (
+          <p
+            role="alert"
+            className="rounded border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            {agent.ambiguousInstalls.length} Modbus extensions are running on this agent (
+            {agent.ambiguousInstalls.map((e) => `${e.id} v${e.version}`).join(", ")}). The agent
+            does not report which one serves reads and writes, and the Start/Stop button above only
+            targets <code>{agent.extension?.id}</code>. Stop the one you are not using:{" "}
+            <code className="rounded bg-muted px-1.5 py-0.5">zelos extensions stop &lt;id&gt;</code>
+          </p>
+        )}
+
         {fixIt && <p className="text-xs text-muted-foreground">{fixIt}</p>}
 
         {agent.kind === "extension-outdated" && agent.missingMethods?.length ? (

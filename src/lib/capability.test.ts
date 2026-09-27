@@ -128,6 +128,38 @@ describe("resolveAgentStatus", () => {
     });
   });
 
+  it("picks the running install over a stopped sibling, in either listed order", () => {
+    const stoppedLocal: ExtensionEntry = { ...localInstallExt, state: "stopped" };
+    for (const exts of [
+      [stoppedLocal, runningExt],
+      [runningExt, stoppedLocal],
+    ]) {
+      const status = resolveAgentStatus("a:1", exts, allRequiredActionPaths(), [meter]);
+      expect(status.kind).toBe("ready");
+      expect(status.extension).toBe(runningExt);
+      expect(status.ambiguousInstalls).toBeUndefined();
+    }
+  });
+
+  it("names both installs when two run, preferring the one meeting the version floor", () => {
+    // A 0.1.5 install (`modbus/`) beside a 0.2.0 one (`Modbus/`). The old one
+    // sorts first by id, so only the version floor moves the pick.
+    const oldLocal: ExtensionEntry = { ...localInstallExt, version: "0.1.5" };
+    const paths = ["modbus/read_register", ...allRequiredActionPaths()];
+    for (const exts of [
+      [oldLocal, runningExt],
+      [runningExt, oldLocal],
+    ]) {
+      const status = resolveAgentStatus("a:1", exts, paths, [meter]);
+      expect(status.kind).toBe("ready");
+      expect(status.extension).toBe(runningExt);
+      expect(status.ambiguousInstalls?.map((e) => e.id)).toEqual([
+        "local.modbus",
+        MODBUS_EXTENSION_ID,
+      ]);
+    }
+  });
+
   it("returns extension-outdated for a 0.1.x extension, listing the missing methods", () => {
     // Lowercase `modbus/` namespace: outdated, not forever "starting".
     const legacy = ["modbus/list_interfaces", "modbus/get_snapshot", "modbus/read_register"];

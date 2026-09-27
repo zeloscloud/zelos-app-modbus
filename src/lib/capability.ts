@@ -65,6 +65,10 @@ export interface AgentStatus {
   missingMethods?: readonly string[];
   /** Present only when `kind === "discovery-failed"`. */
   error?: string;
+  /** Every Modbus install running on this agent, set only when more than one
+   *  is. Action paths never name an install, so which one serves `Modbus/` is
+   *  unknowable, while Start/Stop targets only `extension`. */
+  ambiguousInstalls?: readonly ExtensionEntry[];
 }
 
 export type TopLevelDisabledReason = "not-live" | "no-agents-connected";
@@ -139,14 +143,33 @@ export function resolveAgentStatus(
 
   // Match any known install ID (marketplace canonical OR `local.*` aliases the
   // install-local CLI assigns). Different install methods, same extension.
-  const ext = extensions.find((e) => MODBUS_EXTENSION_INSTALL_IDS.has(e.id));
-  if (!ext) {
+  // Sorted by id: `extensions.list` order is not a contract, and Start/Stop
+  // must not retarget between refreshes.
+  const installs = extensions
+    .filter((e) => MODBUS_EXTENSION_INSTALL_IDS.has(e.id))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (installs.length === 0) {
     return { agent, kind: "extension-missing" };
   }
-  if (ext.state !== "running") {
+  // Prefer running over stopped, then one meeting the version floor.
+  const running = installs.filter((e) => e.state === "running");
+  const ext = running.find((e) => meetsMinVersion(e.version)) ?? running[0] ?? installs[0]!;
+  if (running.length === 0) {
     return { agent, kind: "extension-stopped", extension: ext };
   }
+  const status = resolveRunningStatus(agent, ext, actionPaths, devices, deviceError);
+  return running.length > 1 ? { ...status, ambiguousInstalls: running } : status;
+}
 
+/** Status for an agent whose Modbus extension is up. `ext` is the entry the
+ *  lifecycle controls act on. */
+function resolveRunningStatus(
+  agent: string,
+  ext: ExtensionEntry,
+  actionPaths: readonly string[],
+  devices: readonly ModbusDeviceEntry[] | undefined,
+  deviceError: string | undefined,
+): AgentStatus {
   // Required set incomplete. Only a legacy lowercase `modbus/` path proves an
   // old extension; otherwise it is still coming up. The agent lists standalone
   // actions (`Modbus/scan_device`, ...) before the live session registers, so
@@ -171,6 +194,18 @@ export function resolveAgentStatus(
   }
 
   return { agent, kind: "ready", extension: ext, devices };
+}
+
+/** `major.minor.patch` >= MIN_MODBUS_EXTENSION_VERSION; suffixes ignored. */
+function meetsMinVersion(version: string): boolean {
+  const parse = (v: string) => v.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const have = parse(version);
+  const need = parse(MIN_MODBUS_EXTENSION_VERSION);
+  for (let i = 0; i < need.length; i++) {
+    const h = have[i] ?? 0;
+    if (h !== need[i]) return h > need[i]!;
+  }
+  return true;
 }
 
 /** One-line fix-it copy per failing status. `null` for healthy/in-flight
