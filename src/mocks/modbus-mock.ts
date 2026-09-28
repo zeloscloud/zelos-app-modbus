@@ -69,7 +69,7 @@ export const STARTING_ACTIONS_MS = 6_000;
 /** Wire holding address of `status/spare_sensor`, the register that reads NaN. */
 const NAN_ADDRESS = 22;
 
-/** Action set advertised by `actions.list`: the current extension, a 0.1.x
+/** Action set advertised by `actions.list`: the current extension, a pre-0.1.6
  *  extension (lowercase `modbus/` namespace, per-interface actions), or nothing. */
 type ActionSet = "full" | "legacy" | "none";
 
@@ -461,7 +461,7 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
   const ready = (): SimAgent => ({
     address,
     extInstalled: true,
-    extVersion: "0.2.0",
+    extVersion: "0.1.6",
     extState: "running",
     actionSet: "full",
     actionsReadyAt: null,

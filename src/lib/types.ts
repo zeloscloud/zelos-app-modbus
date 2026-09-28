@@ -48,7 +48,7 @@ export type ModbusMethodName = (typeof MODBUS_METHODS)[keyof typeof MODBUS_METHO
 
 /** Action paths every running Modbus extension must surface before the app
  *  considers it ready. The `Modbus/` namespace and `list_devices` land in
- *  extension 0.2.0. A missing entry means "extension too old", not
+ *  extension 0.1.6. A missing entry means "extension too old", not
  *  "misconfigured". */
 export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = [
   MODBUS_METHODS.listDevices,
@@ -64,7 +64,7 @@ export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = [
 
 /** First extension release carrying the required action set. Used in
  *  remediation copy only — the action-path check above is the real guard. */
-export const MIN_MODBUS_EXTENSION_VERSION = "0.2.0";
+export const MIN_MODBUS_EXTENSION_VERSION = "0.1.6";
 
 /** Namespace every Modbus action path sits under. */
 export const MODBUS_ACTION_PREFIX = "Modbus/";

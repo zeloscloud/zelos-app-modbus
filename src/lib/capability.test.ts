@@ -16,14 +16,14 @@ import { deviceEntry } from "@/components/__tests__/register-fixtures";
 const runningExt: ExtensionEntry = {
   id: MODBUS_EXTENSION_ID,
   name: "Modbus",
-  version: "0.2.0",
+  version: "0.1.6",
   state: "running",
 };
 
 const localInstallExt: ExtensionEntry = {
   id: "local.modbus",
   name: "Modbus",
-  version: "0.2.0",
+  version: "0.1.6",
   state: "running",
 };
 
@@ -142,7 +142,7 @@ describe("resolveAgentStatus", () => {
   });
 
   it("names both installs when two run, preferring the one meeting the version floor", () => {
-    // A 0.1.5 install (`modbus/`) beside a 0.2.0 one (`Modbus/`). The old one
+    // A 0.1.5 install (`modbus/`) beside a 0.1.6 one (`Modbus/`). The old one
     // sorts first by id, so only the version floor moves the pick.
     const oldLocal: ExtensionEntry = { ...localInstallExt, version: "0.1.5" };
     const paths = ["modbus/read_register", ...allRequiredActionPaths()];
@@ -160,7 +160,7 @@ describe("resolveAgentStatus", () => {
     }
   });
 
-  it("returns extension-outdated for a 0.1.x extension, listing the missing methods", () => {
+  it("returns extension-outdated for a pre-0.1.6 extension, listing the missing methods", () => {
     // Lowercase `modbus/` namespace: outdated, not forever "starting".
     const legacy = ["modbus/list_interfaces", "modbus/get_snapshot", "modbus/read_register"];
     const status = resolveAgentStatus("a:1", [runningExt], legacy, undefined);
@@ -175,7 +175,7 @@ describe("resolveAgentStatus", () => {
 
   it("returns extension-starting when only standalone actions are listed", () => {
     // The agent lists an installed extension's standalone actions before its
-    // live session registers; a fresh 0.2.0 start is not outdated.
+    // live session registers; a fresh 0.1.6 start is not outdated.
     const standalone = ["scan_device", "verify_map", "auto_config", "list_serial_ports"].map(
       modbusActionPath,
     );
@@ -325,7 +325,7 @@ describe("remediation", () => {
       kind: "extension-outdated",
       missingMethods: ["get_snapshot"],
     });
-    expect(copy).toMatch(/0\.2\.0\+/);
+    expect(copy).toMatch(/0\.1\.6\+/);
   });
 
   it("suggests install-local and start commands", () => {

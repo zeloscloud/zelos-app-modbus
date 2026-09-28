@@ -29,10 +29,10 @@ paths = ["dist"]
 # This app drives the Modbus agent extension exclusively. The host should
 # surface a clear "missing dependency" state at install time if the required
 # extension is not present, instead of leaving the user with a useless
-# "extension missing" banner. 0.2.0 is the first extension release carrying the
+# "extension missing" banner. 0.1.6 is the first extension release carrying the
 # `Modbus/` namespace and per-device actions (list_devices, `device` param); the
 # app's capability resolver also gates on those actions actually being
 # registered, which is the real runtime guard.
 [[requires]]
 extension = "zeloscloud.zelos-extension-modbus"
-version = ">=0.2.0-0"
+version = ">=0.1.6"

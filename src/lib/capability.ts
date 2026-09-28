@@ -26,7 +26,7 @@ import {
   type WorkspaceModeKind,
 } from "./types";
 
-/** Pre-0.2.0 extensions registered under lowercase `modbus/`. */
+/** Extensions before 0.1.6 registered under lowercase `modbus/`. */
 const LEGACY_MODBUS_ACTION_PREFIX = "modbus/";
 
 export type AgentStatusKind =

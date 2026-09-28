@@ -44,7 +44,7 @@ Pick a capability state with `?mock=<scenario>`:
 | `ready` (default)    | One agent, two mapped units on a TCP connection + a raw-only RTU device |
 | `extension-missing`  | Agent has no Modbus extension installed                                 |
 | `extension-stopped`  | Installed but not running (Start button live)                           |
-| `extension-outdated` | 0.1.x action set (`modbus/*`) — the required-methods gate trips         |
+| `extension-outdated` | Pre-0.1.6 action set (`modbus/*`) — the required-methods gate trips     |
 | `no-devices`         | Running, healthy actions, zero devices configured                       |
 | `multi-agent`        | One ready agent + one missing the extension                             |
 

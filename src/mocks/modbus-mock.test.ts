@@ -58,7 +58,7 @@ describe("discovery surface", () => {
     }
   });
 
-  it("advertises the 0.1.x namespace in the outdated scenario", async () => {
+  it("advertises the pre-0.1.6 namespace in the outdated scenario", async () => {
     const bridge = makeHost("extension-outdated");
     const paths = (await actions.list(bridge))[AGENT] ?? [];
     expect(paths).toContain("modbus/list_interfaces");

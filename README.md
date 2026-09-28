@@ -2,7 +2,7 @@
 
 Read and write Modbus registers from the Zelos desktop app — pairs with the
 [`zeloscloud.zelos-extension-modbus`](https://github.com/zeloscloud/zelos-extension-modbus)
-agent extension (0.2.0+).
+agent extension (0.1.6+).
 
 - 🛰️ One card per agent, devices grouped by connection (TCP / RTU) with live connection + poll counters
 - 📇 One table per device: registers from the map and raw addresses, side by side, saved between sessions
