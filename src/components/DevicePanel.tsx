@@ -4,7 +4,8 @@
  *
  *  A device with no register map (`map_name === null`) is not a special case
  *  any more: its catalog is simply empty, so only raw rows can be added to it.
- *  A map still being discovered, or whose discovery failed, is not "no map". */
+ *  A map still being discovered, or whose discovery failed, is not "no map",
+ *  and neither is an auto-scanned device: its catalog is what the scan found. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { AlertCircle, Loader2, Plus } from "lucide-react";
@@ -16,7 +17,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useRegisters } from "@/hooks/use-registers";
 import { useSnapshot } from "@/hooks/use-snapshot";
-import type { ModbusDeviceEntry, PollHealth, RegisterEntry } from "@/lib/types";
+import type { AutoScanStatus, ModbusDeviceEntry, PollHealth, RegisterEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { defaultRawRow, type NewWatchRow, type RowPatch, type WatchRow } from "@/lib/watch-store";
 
@@ -56,6 +57,7 @@ export function DevicePanel({
     agentAddress,
     device.name,
     device.map_name,
+    device.auto_scan != null,
     device.register_count,
     device.address_base,
   );
@@ -69,7 +71,8 @@ export function DevicePanel({
   const catalogError = registersQuery.error instanceof Error ? registersQuery.error : null;
   // Named rows would flash as orphans if they rendered before the catalog they
   // join against, so a mapped device waits for it. Raw rows don't care.
-  const catalogPending = device.map_name !== null && registersQuery.isLoading;
+  const catalogPending =
+    (device.map_name !== null || device.auto_scan != null) && registersQuery.isLoading;
   // A device with no map has nothing to join against and never will, so a
   // named row on it really is orphaned. A catalog that failed to load says
   // nothing about any row — those rows keep working on their paths alone.
@@ -115,6 +118,15 @@ export function DevicePanel({
           )}
           {map.kind === "mapped" && <span className="text-muted-foreground">map {map.name}</span>}
           {map.kind === "raw" && <Badge variant="warning">raw only</Badge>}
+          {map.kind === "auto-scan" &&
+            (map.scan.state === "scanning" ? (
+              <Badge variant="outline" className="gap-1">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                scanning{map.scan.table !== null && ` ${map.scan.table}`}… {map.scan.found} found
+              </Badge>
+            ) : (
+              <Badge variant="outline">auto-scan: {map.scan.found} found</Badge>
+            ))}
           {map.kind === "pending" && (
             <Badge variant="warning" className="gap-1">
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -233,15 +245,17 @@ export function DevicePanel({
 export type MapState =
   | { kind: "mapped"; name: string }
   | { kind: "raw" }
+  | { kind: "auto-scan"; scan: AutoScanStatus }
   | { kind: "pending" }
   | { kind: "failed"; error: string };
 
-type MapFields = Pick<PollHealth, "map_pending" | "error">;
+type MapFields = Pick<PollHealth, "map_pending" | "error" | "auto_scan">;
 
 /** What the device's register map is doing. The 1 Hz snapshot is fresher than
  *  `list_devices` for pending/error; `map_name` only comes from the latter, so a
  *  map the snapshot calls done stays pending until `list_devices` names it. A
- *  failed discovery is retried (still pending) but reads as failed. */
+ *  failed discovery is retried (still pending) but reads as failed. Scan
+ *  progress prefers the snapshot too. */
 export function mapState(
   device: MapFields & { map_name: string | null },
   snapshot: MapFields | undefined,
@@ -249,6 +263,8 @@ export function mapState(
   if (device.map_name !== null) return { kind: "mapped", name: device.map_name };
   const live = snapshot ?? device;
   if (live.error !== null) return { kind: "failed", error: live.error };
+  const scan = live.auto_scan ?? device.auto_scan;
+  if (scan != null) return { kind: "auto-scan", scan };
   if (live.map_pending || device.map_pending) return { kind: "pending" };
   return { kind: "raw" };
 }

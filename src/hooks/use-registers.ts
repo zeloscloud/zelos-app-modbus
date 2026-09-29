@@ -4,7 +4,10 @@
  *  when the extension restarts with a different config — so the map name is part
  *  of the query key and a known name makes the entry permanently fresh. When the
  *  name isn't known yet (list_devices still in flight) we fall back to a 30 s
- *  staleTime so the catalog still lands without a manual refresh. */
+ *  staleTime so the catalog still lands without a manual refresh.
+ *
+ *  An auto-scanned device has no map name but a catalog that grows while it
+ *  scans; `register_count` in the key refetches it as registers are found. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
@@ -18,8 +21,10 @@ export function useRegisters(
   bridge: BridgeTransport,
   agent: string,
   device: string,
-  /** `map_name` from `list_devices`; null means raw-only (no catalog). */
+  /** `map_name` from `list_devices`; null means no map. */
   mapName: string | null,
+  /** `auto_scan` is set: no map, but a discovered catalog. */
+  autoScanned: boolean,
   /** `register_count` from `list_devices`. Part of the key because a restart
    *  can swap the map's contents without changing its name, and this is the one
    *  observable that moves when it does. */
@@ -31,8 +36,10 @@ export function useRegisters(
     queryKey: ["modbus-registers", agent, device, mapName, registerCount, addressBase],
     queryFn: async () => listRegisters(bridge, agent, device),
     // A raw-only device has no catalog to fetch.
-    enabled: mapName !== null,
-    staleTime: mapName !== null ? Number.POSITIVE_INFINITY : UNKNOWN_MAP_STALE_MS,
+    enabled: mapName !== null || autoScanned,
+    staleTime: mapName !== null || autoScanned ? Number.POSITIVE_INFINITY : UNKNOWN_MAP_STALE_MS,
+    // Keep the catalog on screen while a scan's next count loads.
+    placeholderData: (prev) => (autoScanned ? prev : undefined),
     refetchOnWindowFocus: false,
   });
 }

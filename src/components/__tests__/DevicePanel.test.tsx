@@ -77,15 +77,23 @@ function intercept(
   } as unknown as BridgeTransport;
 }
 
-/** `mapped: false` picks the device with no register map — the raw-only path. */
+/** `mapped: false` picks the device with no register map — the raw-only path;
+ *  `name` picks one device outright. */
 async function renderPanel({
   mapped = true,
+  name,
   wrap,
-}: { mapped?: boolean; wrap?: (bridge: BridgeTransport) => BridgeTransport } = {}) {
+}: {
+  mapped?: boolean;
+  name?: string;
+  wrap?: (bridge: BridgeTransport) => BridgeTransport;
+} = {}) {
   const host = makeHost();
   const bridge = wrap ? wrap(host) : host;
   const devices = (await listDevices(host, AGENT)).devices;
-  const device = devices.find((d) => (mapped ? d.map_name !== null : d.map_name === null));
+  const device = devices.find((d) =>
+    name !== undefined ? d.name === name : mapped ? d.map_name !== null : d.map_name === null,
+  );
   if (!device) throw new Error(`mock host has no ${mapped ? "mapped" : "raw-only"} device`);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
@@ -100,7 +108,7 @@ async function renderPanel({
         <Harness bridge={bridge} device={{ ...device, ...patch }} />
       </QueryClientProvider>,
     );
-  return { device, update };
+  return { device, update, host };
 }
 
 /** Register options in the dialog are buttons wrapping the register name. */
@@ -294,8 +302,34 @@ describe("DevicePanel rows section", () => {
     ],
     // The fresher snapshot clears a stale list_devices error.
     ["recovered", { ...map, error: "boom" }, map, { kind: "raw" }],
+    [
+      "auto-scanned",
+      { ...map, auto_scan: { state: "scanning", table: "holding", found: 0, ignored: 0 } },
+      { ...map, auto_scan: { state: "done", table: null, found: 3, ignored: 1 } },
+      { kind: "auto-scan", scan: { state: "done", table: null, found: 3, ignored: 1 } },
+    ],
   ])("reads the register map as %s", (_, device, snapshot, expected) => {
     expect(mapState(device, snapshot)).toEqual(expected);
+  });
+
+  it("offers an auto-scanned device's discovered registers as named rows", async () => {
+    const { device, update, host } = await renderPanel({ name: "dev_ttyUSB0/scanner" });
+    expect(await screen.findByText("scanning holding… 0 found")).toBeInTheDocument();
+    expect(screen.queryByText("raw only")).not.toBeInTheDocument();
+
+    // The scan finds a register per tick; list_devices' count refetches the catalog.
+    let found: ModbusDeviceEntry | undefined;
+    await waitFor(
+      async () => {
+        found = (await listDevices(host, AGENT)).devices.find((d) => d.name === device.name);
+        expect(found?.register_count).toBeGreaterThan(0);
+      },
+      { timeout: 3_000 },
+    );
+    if (found) update(found);
+    await waitFor(() => expect(screen.queryByText("Loading register map…")).toBeNull());
+    await openDialog();
+    expect(await screen.findByText("1_value")).toBeInTheDocument();
   });
 
   it("shows disconnected instead of a rate while the link is down", async () => {

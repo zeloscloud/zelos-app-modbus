@@ -87,17 +87,18 @@ describe("discovery surface", () => {
     }
   });
 
-  it("reports two mapped units on one connection and a raw-only device on another", async () => {
+  it("reports two mapped units on one connection, raw-only and auto-scan devices on another", async () => {
     const bridge = makeHost("ready");
     const { devices, count } = await listDevices(bridge, AGENT);
-    expect(count).toBe(3);
+    expect(count).toBe(4);
     expect(devices.map((d) => [d.name, d.connection, d.device, d.unit_id])).toEqual([
       [METER, "meter_panel", "unit1", 1],
       [UNIT2, "meter_panel", "unit2", 2],
       [PROBE, "dev_ttyUSB0", "probe", 3],
+      ["dev_ttyUSB0/scanner", "dev_ttyUSB0", "scanner", 4],
     ]);
     expect(devices[0]).toMatchObject({ map_name: "power_meter", endpoint: "127.0.0.1:5020" });
-    expect(devices.map((d) => d.address_base)).toEqual([1, 0, 1]);
+    expect(devices.map((d) => d.address_base)).toEqual([1, 0, 1, 1]);
     expect(devices[2]).toMatchObject({ transport: "rtu", map_name: null, register_count: 0 });
   });
 
@@ -354,6 +355,6 @@ describe("multi-agent scenario", () => {
     const installed = await extensions.list(bridge);
     expect(installed["localhost"]).toEqual([]);
     expect(installed["remote:2300"]?.[0]?.state).toBe("running");
-    expect((await listDevices(bridge, "remote:2300")).count).toBe(3);
+    expect((await listDevices(bridge, "remote:2300")).count).toBe(4);
   });
 });

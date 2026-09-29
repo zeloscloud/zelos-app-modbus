@@ -140,7 +140,7 @@ export interface ModbusDeviceEntry extends PollHealth {
   /** Trace path, e.g. `Modbus/10_0_0_5/unit1`; null before the trace is set up. */
   trace_path: string | null;
   /** Register-map name; null while `map_pending`, after a failed discovery
-   *  (`error`), or when the device runs raw-only. */
+   *  (`error`), when auto-scanned (`auto_scan`), or when the device runs raw-only. */
   map_name: string | null;
   /** 1 for a device with no map. */
   address_base: AddressBase;
@@ -194,6 +194,19 @@ export interface PollHealth {
   error: string | null;
   /** Register map still being discovered (e.g. SunSpec). */
   map_pending: boolean;
+  /** Set for a device with no map that discovers its registers at start; absent
+   *  or null otherwise (and on extension 0.1.6). */
+  auto_scan?: AutoScanStatus | null | undefined;
+}
+
+export interface AutoScanStatus {
+  state: "scanning" | "done";
+  /** Table being scanned, null when done. */
+  table: string | null;
+  /** Registers discovered so far. */
+  found: number;
+  /** Refused or silent registers, retried every 10 min. */
+  ignored: number;
 }
 
 export interface RefusedBlock {

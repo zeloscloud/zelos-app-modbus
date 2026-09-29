@@ -321,6 +321,8 @@ interface SimDevice {
    *  all. */
   values: Map<string, { value: number | boolean | null; ts_ms: number }>;
   poll_count: number;
+  /** Auto-scan only: registers still to be found, one per tick. */
+  scanQueue?: RegisterDef[];
 }
 
 interface SimAgent {
@@ -457,6 +459,88 @@ function buildProbe(): SimDevice {
   };
 }
 
+/** A raw register as auto-scan traces it: its own event, one `<addr>_value`
+ *  field, read-only. `address` is in base 1, the no-map default. */
+function scanned(
+  type: RegisterTableType,
+  address: number,
+  live?: (t: number) => number,
+): RegisterDef {
+  const prefix = {
+    holding: "registers",
+    input: "input_registers",
+    coil: "coils",
+    discrete_input: "discrete_inputs",
+  }[type];
+  return {
+    event: `${prefix}/${address}`,
+    name: `${address}_value`,
+    address: address - 1,
+    type,
+    ...(isBitTable(type) ? { seed: address % 2 === 1 } : { seed: address * 10 }),
+    ...(live ? { live } : {}),
+  };
+}
+
+/** A device with no map that auto-scans: it finds one register per tick, then
+ *  reports the scan done. */
+function buildScanner(): SimDevice {
+  const scanQueue = [
+    scanned("holding", 1, (t) => Math.round(500 + 50 * Math.sin(t / 3))),
+    scanned("holding", 2),
+    scanned("holding", 3),
+    scanned("input", 1, (t) => Math.round(t) % 1000),
+    scanned("input", 2),
+    scanned("coil", 1),
+    scanned("coil", 2),
+    scanned("discrete_input", 1),
+  ];
+  return {
+    entry: deviceEntry("dev_ttyUSB0", "scanner", {
+      unit_id: 4,
+      transport: "rtu",
+      endpoint: "/dev/ttyUSB0@9600",
+      map_name: null,
+      address_base: 1,
+      register_count: 0,
+      rate: 1,
+      write_mode: "auto",
+      raw_writes: false,
+      requested_rate: 1,
+      achieved_rate: null,
+      overload_pct: null,
+      tiers: [],
+      demoted: false,
+      retry_in_s: null,
+      auto_scan: { state: "scanning", table: "holding", found: 0, ignored: 0 },
+    }),
+    defs: [],
+    registers: [],
+    memory: emptyMemory(),
+    values: new Map(),
+    poll_count: 0,
+    scanQueue,
+  };
+}
+
+/** Find the next queued register: trace it, then report progress. */
+function scanStep(dev: SimDevice): void {
+  const def = dev.scanQueue?.shift();
+  if (!def || !dev.scanQueue) return;
+  const entry = toEntry(def, dev.entry.address_base);
+  dev.defs.push(def);
+  dev.registers.push(entry);
+  if (def.seed !== undefined) writeMemory(dev, entry, def.seed);
+  const next = dev.scanQueue[0];
+  dev.entry.register_count = dev.registers.length;
+  dev.entry.auto_scan = {
+    state: next ? "scanning" : "done",
+    table: next ? (next.type ?? "holding") : null,
+    found: dev.registers.length,
+    ignored: next ? 0 : 2,
+  };
+}
+
 function buildAgent(address: string, scenario: MockScenario): SimAgent {
   const ready = (): SimAgent => ({
     address,
@@ -466,7 +550,7 @@ function buildAgent(address: string, scenario: MockScenario): SimAgent {
     actionSet: "full",
     actionsReadyAt: null,
     devices: new Map(
-      [buildMeter(1, 1, true), buildMeter(2, 0, false), buildProbe()].map(
+      [buildMeter(1, 1, true), buildMeter(2, 0, false), buildProbe(), buildScanner()].map(
         (d) => [d.entry.name, d] as const,
       ),
     ),
@@ -576,6 +660,7 @@ function pollSweep(dev: SimDevice, now: number): void {
 /** Advance the simulated device: measurement registers move, configuration
  *  registers (setpoints, coils, calibration) keep whatever was written to them. */
 function tick(dev: SimDevice, elapsedSeconds: number): void {
+  scanStep(dev);
   dev.defs.forEach((def, i) => {
     const entry = dev.registers[i];
     if (!def.live || entry === undefined) return;
@@ -781,6 +866,7 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
           refused: dev.entry.refused,
           error: dev.entry.error,
           map_pending: dev.entry.map_pending,
+          auto_scan: dev.entry.auto_scan ?? null,
           captured_at_unix_ms: Date.now(),
           values,
           success: true,
@@ -792,7 +878,8 @@ async function handleActionExecute(agentMap: Map<string, SimAgent>, params: unkn
       return {
         status: "done",
         result: {
-          registers: dev.registers,
+          // A copy: auto-scan grows the list, and the wire never shares it.
+          registers: [...dev.registers],
           count: dev.registers.length,
           map_name: dev.entry.map_name,
           success: true,
