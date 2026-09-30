@@ -3,6 +3,8 @@ version = "0.1.0"
 description = "Read and write named and raw Modbus registers through the Zelos Modbus agent extension."
 author = "Zelos"
 repository = "https://github.com/zeloscloud/zelos-app-modbus"
+keywords = ["modbus", "modbus-tcp", "modbus-rtu", "registers", "coils", "plc", "scada", "industrial", "automation"]
+categories = ["Industrial", "Automation"]
 icon = "assets/icon.png"
 readme = "README.md"
 
