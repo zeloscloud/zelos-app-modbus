@@ -331,7 +331,7 @@ describe("DevicePanel rows section", () => {
     if (found) update(found);
     await waitFor(() => expect(screen.queryByText("Loading register map…")).toBeNull());
     await openDialog();
-    expect(await screen.findByText("1_value")).toBeInTheDocument();
+    expect(await screen.findByText("hr_1")).toBeInTheDocument();
   });
 
   it("shows disconnected instead of a rate while the link is down", async () => {

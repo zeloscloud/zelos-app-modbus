@@ -459,22 +459,22 @@ function buildProbe(): SimDevice {
   };
 }
 
-/** A raw register as auto-scan traces it: its own event, one `<addr>_value`
- *  field, read-only. `address` is in base 1, the no-map default. */
+/** A raw register as auto-scan traces it: its own event, one field named for
+ *  its table (`hr_<addr>`, `ir_`, `coil_`, `di_`), read-only. `address` is in base 1, the no-map default. */
 function scanned(
   type: RegisterTableType,
   address: number,
   live?: (t: number) => number,
 ): RegisterDef {
-  const prefix = {
-    holding: "holding_registers",
-    input: "input_registers",
-    coil: "coils",
-    discrete_input: "discrete_inputs",
+  const [event, field] = {
+    holding: ["holding_registers", "hr"],
+    input: ["input_registers", "ir"],
+    coil: ["coils", "coil"],
+    discrete_input: ["discrete_inputs", "di"],
   }[type];
   return {
-    event: `${prefix}/${address}`,
-    name: `${address}_value`,
+    event: `${event}/${address}`,
+    name: `${field}_${address}`,
     address: address - 1,
     type,
     ...(isBitTable(type) ? { seed: address % 2 === 1 } : { seed: address * 10 }),
