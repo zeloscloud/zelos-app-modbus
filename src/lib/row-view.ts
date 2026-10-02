@@ -38,11 +38,20 @@ import {
 /** Staleness cutoff when the poll rate is unknown or disabled. */
 const DEFAULT_STALE_MS = 5_000;
 
+/** Spec table names: data-model prefix and read function code. */
+export const TABLE_NAMES: Record<RegisterTableType, string> = {
+  holding: "Holding registers (4x, FC03)",
+  input: "Input registers (3x, FC04)",
+  coil: "Coils (0x, FC01)",
+  discrete_input: "Discrete inputs (1x, FC02)",
+};
+
+/** Short form for table cells, selects and badges; TABLE_NAMES in their tooltips. */
 export const TABLE_LABELS: Record<RegisterTableType, string> = {
-  holding: "holding",
-  input: "input",
-  coil: "coil",
-  discrete_input: "discrete",
+  holding: "Holding 4x",
+  input: "Input 3x",
+  coil: "Coil 0x",
+  discrete_input: "Discrete 1x",
 };
 
 /** Device documentation writes byte order as a byte pattern, and it fits a table

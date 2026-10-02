@@ -467,7 +467,7 @@ function scanned(
   live?: (t: number) => number,
 ): RegisterDef {
   const prefix = {
-    holding: "registers",
+    holding: "holding_registers",
     input: "input_registers",
     coil: "coils",
     discrete_input: "discrete_inputs",

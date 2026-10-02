@@ -65,6 +65,7 @@ import {
 import {
   BYTE_ORDER_LABELS,
   TABLE_LABELS,
+  TABLE_NAMES,
   namedValueState,
   namedWriteModel,
   rawValueState,
@@ -195,7 +196,7 @@ export function RegisterTable({
         <colgroup>
           <col className="w-[20%]" />
           <col className="w-[88px]" />
-          <col className="w-[76px]" />
+          <col className="w-[92px]" />
           <col className="w-[140px]" />
           <col className="w-[40px]" />
           <col className="w-[148px]" />
@@ -357,7 +358,10 @@ function NamedRegisterRowView({
         </div>
       </Td>
       <Td className="font-mono text-[11px]">{reg === null ? "—" : formatAddress(reg.address)}</Td>
-      <MetaCell text={reg === null ? "—" : TABLE_LABELS[reg.type]} />
+      <MetaCell
+        text={reg === null ? "—" : TABLE_LABELS[reg.type]}
+        title={reg === null ? undefined : TABLE_NAMES[reg.type]}
+      />
       <MetaCell text={reg === null ? "—" : typeSummary(reg)} mono />
       <MetaCell text={reg?.unit || "—"} title={reg?.unit || undefined} />
       <ValueCell
@@ -523,7 +527,7 @@ function RawRegisterRowView({
             if (isRegisterTableType(next)) patch({ table: next });
           }}
           label="Raw table"
-          title={`Modbus table — ${row.table}`}
+          title={TABLE_NAMES[row.table]}
           className="w-full"
         />
       </Td>
@@ -539,7 +543,7 @@ function RawRegisterRowView({
             disabled={bits}
             title={
               bits
-                ? `${row.table} addresses are single bits — always bool`
+                ? `${TABLE_NAMES[row.table]}: single bits, always bool`
                 : `Datatype — ${row.datatype}`
             }
             className="min-w-0 flex-1"
@@ -940,7 +944,11 @@ function sameRowProps<P extends { state: ValueState }>(prev: P, next: P): boolea
  *  so both name a table the same. */
 export function TableBadge({ type }: { type: RegisterTableType }) {
   return (
-    <Badge variant={isWritableTable(type) ? "outline" : "secondary"} className="px-1.5 text-[10px]">
+    <Badge
+      variant={isWritableTable(type) ? "outline" : "secondary"}
+      className="px-1.5 text-[10px]"
+      title={TABLE_NAMES[type]}
+    >
       {TABLE_LABELS[type]}
     </Badge>
   );

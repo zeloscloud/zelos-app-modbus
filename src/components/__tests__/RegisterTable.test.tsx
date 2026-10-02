@@ -208,7 +208,7 @@ describe("RegisterTable columns", () => {
     renderTable({ rows: watchRows(["status/temperature"]) });
     const row = bodyRow();
     expect(cell(row, COL.address)).toHaveTextContent("20 (0x0014)");
-    expect(cell(row, COL.table)).toHaveTextContent("holding");
+    expect(cell(row, COL.table)).toHaveTextContent("Holding 4x");
     // Scale rides along with the datatype it applies to.
     expect(cell(row, COL.type)).toHaveTextContent("int16 ×0.1");
     expect(cell(row, COL.unit)).toHaveTextContent("°C");
@@ -216,9 +216,9 @@ describe("RegisterTable columns", () => {
 
   it("names a bit table in full and dashes an absent unit", () => {
     renderTable({ rows: watchRows(["control/relay", "inputs/firmware_version"]) });
-    expect(cell(bodyRow(0), COL.table)).toHaveTextContent("coil");
+    expect(cell(bodyRow(0), COL.table)).toHaveTextContent("Coil 0x");
     expect(cell(bodyRow(0), COL.unit)).toHaveTextContent("—");
-    expect(cell(bodyRow(1), COL.table)).toHaveTextContent("input");
+    expect(cell(bodyRow(1), COL.table)).toHaveTextContent("Input 3x");
   });
 
   it("puts Read in the Value cell, and Write and Delete in their own columns", () => {
