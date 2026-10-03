@@ -1,6 +1,6 @@
 /** Test-only: the mock host on a bridge, in one place.
  *
- *  Both the mock-host contract tests and the InterfacePanel integration tests
+ *  Both the mock-host contract tests and the DevicePanel integration tests
  *  need the same shim — a minimal `MockBridge` stand-in with the simulator
  *  installed on it, and an `invoke` that routes straight at the installed
  *  handler. Nothing in the app imports this, so it never reaches the bundle. */

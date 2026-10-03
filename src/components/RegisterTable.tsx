@@ -1,4 +1,4 @@
-/** The one table an interface has: every row the user added, named or raw, with
+/** The one table a device has: every row the user added, named or raw, with
  *  live values, an on-demand read and an inline write editor.
  *
  *  Two row kinds share the columns (see `lib/watch-store`):
@@ -82,13 +82,16 @@ import {
   BYTE_ORDERS,
   MODBUS_DATATYPES,
   REGISTER_TYPES,
+  type AddressBase,
   type ModbusDatatype,
   type ModbusSnapshot,
+  type NamedValue,
   type RegisterEntry,
   type RegisterTableType,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
+  baseChangedError,
   interpretRawRead,
   planRawRead,
   planRawWrite,
@@ -108,20 +111,26 @@ const FLASH_MS = 500;
 /** What the cell says instead of a number the wire couldn't carry. */
 const UNREPRESENTABLE_TITLE = "device returned a non-finite value (NaN/Inf)";
 
+/** Why a raw row has no write control. */
+const RAW_WRITES_OFF = "raw writes are off (Modbus extension: Advanced > Allow Raw Writes)";
+
 /** Shared array identity, so a hint prop can't defeat the row memo. */
 const NOT_POLLED: readonly string[] = ["not polled"];
 
 export interface RegisterTableProps {
   bridge: BridgeTransport;
   agentAddress: string;
-  interfaceName: string;
-  /** Interface default poll cadence in seconds — the fallback for registers
-   *  whose own `poll_interval` is null. */
-  interfacePollInterval: number;
-  /** The interface's catalog. Named rows join against it by path; nothing about a
-   *  register is ever copied into a stored row. Empty for a raw-only interface. */
+  deviceName: string;
+  /** The device's address base; raw rows are typed and validated in it. */
+  addressBase: AddressBase;
+  /** The device's `write_mode`; `fc16` sends a one-word raw write as FC16. */
+  writeMode: string;
+  /** The device's `raw_writes`: false disables every raw row's write control. */
+  rawWrites: boolean;
+  /** The device's catalog. Named rows join against it by path; nothing about a
+   *  register is ever copied into a stored row. Empty for a raw-only device. */
   registers: readonly RegisterEntry[];
-  /** Rows for this (agent, interface), in insertion order. */
+  /** Rows for this (agent, device), in insertion order. */
   rows: readonly WatchRow[];
   /** Whether {@link registers} is the catalog's real content. False while the
    *  catalog is unavailable — during which a path that isn't in it is unknown,
@@ -138,8 +147,10 @@ export interface RegisterTableProps {
 export function RegisterTable({
   bridge,
   agentAddress,
-  interfaceName,
-  interfacePollInterval,
+  deviceName,
+  addressBase,
+  writeMode,
+  rawWrites,
   registers,
   rows,
   catalogReady,
@@ -157,7 +168,7 @@ export function RegisterTable({
   const snapshotRef = React.useRef(snapshot);
   snapshotRef.current = snapshot;
 
-  const handleOverlay = React.useCallback((path: string, value: number | boolean | null) => {
+  const handleOverlay = React.useCallback((path: string, value: NamedValue) => {
     // Remember which poll sample this read overtook, in the agent's clock, so
     // the poll can take the row back the moment it reports a newer one.
     const supersedes = snapshotRef.current?.values[path]?.ts_ms ?? null;
@@ -213,7 +224,10 @@ export function RegisterTable({
                   key={row.id}
                   bridge={bridge}
                   agentAddress={agentAddress}
-                  interfaceName={interfaceName}
+                  deviceName={deviceName}
+                  addressBase={addressBase}
+                  writeMode={writeMode}
+                  rawWrites={rawWrites}
                   row={row}
                   onUpdateRow={onUpdateRow}
                   onRemoveRow={onRemoveRow}
@@ -230,16 +244,13 @@ export function RegisterTable({
                 key={row.id}
                 bridge={bridge}
                 agentAddress={agentAddress}
-                interfaceName={interfaceName}
+                deviceName={deviceName}
                 reg={reg}
                 row={row}
                 state={namedValueState(resolveValue(row.path, snapshot, overlay), {
-                  thresholdMs: stalenessThresholdMs(
-                    reg?.poll_interval ?? null,
-                    interfacePollInterval,
-                  ),
+                  thresholdMs: stalenessThresholdMs(reg?.rate ?? 0),
                   snapshotCapturedAt: snapshot?.captured_at_unix_ms ?? null,
-                  polled: reg?.poll_interval !== 0,
+                  polled: reg?.rate !== 0,
                 })}
                 onValueRead={handleOverlay}
                 onUpdateRow={onUpdateRow}
@@ -258,13 +269,13 @@ export function RegisterTable({
 interface NamedRowProps {
   bridge: BridgeTransport;
   agentAddress: string;
-  interfaceName: string;
+  deviceName: string;
   /** The catalog entry, or null when the catalog couldn't be loaded. The row
    *  still works without it — every named action takes the path. */
   reg: RegisterEntry | null;
   row: NamedWatchRow;
   state: ValueState;
-  onValueRead: (path: string, value: number | boolean | null) => void;
+  onValueRead: (path: string, value: NamedValue) => void;
   onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
 }
@@ -272,7 +283,7 @@ interface NamedRowProps {
 function NamedRegisterRowView({
   bridge,
   agentAddress,
-  interfaceName,
+  deviceName,
   reg,
   row,
   state,
@@ -284,7 +295,7 @@ function NamedRegisterRowView({
   const { flash, flashNow } = useValueFlash();
   const { busy, run } = useAction<"read" | "write">(path, () => ({
     agent: agentAddress,
-    interface: interfaceName,
+    device: deviceName,
     register:
       reg === null
         ? { path, catalog: "unavailable" }
@@ -301,14 +312,14 @@ function NamedRegisterRowView({
   // Without the catalog we can't know whether anything polls this register, and
   // an unpolled one would otherwise never show the value it was just given — so
   // confirm with a read-back, which costs one action and is never wrong.
-  const readBackAfterWrite = reg === null || reg.poll_interval === 0;
-  const notPolled = reg?.poll_interval === 0;
+  const readBackAfterWrite = reg === null || reg.rate === 0;
+  const notPolled = reg?.rate === 0;
 
   /** A read landed: publish it and flash the value. The flash is the whole
    *  success signal — no label, no toast, no reflow. A `null` value is a landed
    *  read too (the device answered with a non-finite float), so it flashes like
    *  any other; the cell says what it can't show. */
-  function acceptRead(value: number | boolean | null) {
+  function acceptRead(value: NamedValue) {
     onValueRead(path, value);
     flashNow();
   }
@@ -320,7 +331,7 @@ function NamedRegisterRowView({
     run(
       "write",
       async () => {
-        await writeNamedRegister(bridge, agentAddress, interfaceName, path, numeric);
+        await writeNamedRegister(bridge, agentAddress, deviceName, path, numeric);
         // The draft is deliberately left as typed — repeating a setpoint is a
         // normal bench move, so Write stays armed until the user edits or clears
         // it. Polled registers land on the next snapshot tick; unpolled ones
@@ -328,7 +339,7 @@ function NamedRegisterRowView({
         // Either way the value cell is the only receipt the write gets, and it
         // flashes even when the value it lands on is the one already showing.
         if (readBackAfterWrite) {
-          const res = await readNamedRegister(bridge, agentAddress, interfaceName, path);
+          const res = await readNamedRegister(bridge, agentAddress, deviceName, path);
           acceptRead(res.value);
         } else {
           flashNow();
@@ -357,7 +368,7 @@ function NamedRegisterRowView({
         reading={busy === "read"}
         onRead={() =>
           run("read", async () => {
-            const res = await readNamedRegister(bridge, agentAddress, interfaceName, path);
+            const res = await readNamedRegister(bridge, agentAddress, deviceName, path);
             acceptRead(res.value);
           })
         }
@@ -389,7 +400,10 @@ const NamedRegisterRow = React.memo(NamedRegisterRowView, sameRowProps);
 interface RawRowProps {
   bridge: BridgeTransport;
   agentAddress: string;
-  interfaceName: string;
+  deviceName: string;
+  addressBase: AddressBase;
+  writeMode: string;
+  rawWrites: boolean;
   row: RawWatchRow;
   onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
@@ -398,7 +412,10 @@ interface RawRowProps {
 function RawRegisterRowView({
   bridge,
   agentAddress,
-  interfaceName,
+  deviceName,
+  addressBase,
+  writeMode,
+  rawWrites,
   row,
   onUpdateRow,
   onRemoveRow,
@@ -412,7 +429,7 @@ function RawRegisterRowView({
   const label = rawRowLabel(row);
   const { busy, run } = useAction<"read" | "write">(label, () => ({
     agent: agentAddress,
-    interface: interfaceName,
+    device: deviceName,
     row,
   }));
 
@@ -421,8 +438,11 @@ function RawRegisterRowView({
   const state = rawValueState(readout?.target === target ? readout.value : null);
   // An address the user is still typing (or has typed wrong) is not an address to
   // act on: the row would silently read or write the last committed one instead.
-  const addressReady = parseAddress(addressDraft) !== null;
-  const blocked = busy !== null || !addressReady;
+  const addressReady = parseAddress(addressDraft, addressBase) !== null;
+  // The row's address was typed under another base; it names a different
+  // register now. The planners refuse too; this surfaces why.
+  const baseError = row.base === addressBase ? null : baseChangedError(row.base, addressBase);
+  const blocked = busy !== null || !addressReady || baseError !== null;
 
   function patch(next: RowPatch) {
     onUpdateRow(row.id, next);
@@ -433,14 +453,16 @@ function RawRegisterRowView({
    *  good value persisted. */
   function editAddress(next: string) {
     setAddressDraft(next);
-    if (next !== row.address && parseAddress(next) !== null) patch({ address: next });
+    if (next !== row.address && parseAddress(next, addressBase) !== null) {
+      patch({ address: next, base: addressBase });
+    }
   }
 
   /** Read one value and show it. Throws, so `useAction` reports it. */
   async function performRead() {
-    const planned = planRawRead(row);
+    const planned = planRawRead(row, addressBase);
     if (!planned.ok) throw new Error(planned.error);
-    const res = await readRegister(bridge, agentAddress, interfaceName, {
+    const res = await readRegister(bridge, agentAddress, deviceName, {
       address: planned.plan.address,
       reg_type: planned.plan.table,
       count: planned.plan.count,
@@ -453,18 +475,18 @@ function RawRegisterRowView({
     run(
       "write",
       async () => {
-        const planned = planRawWrite(row, value);
+        const planned = planRawWrite(row, value, addressBase, writeMode);
         if (!planned.ok) throw new Error(planned.error);
         const plan = planned.plan;
         switch (plan.kind) {
           case "coil":
-            await writeCoil(bridge, agentAddress, interfaceName, plan.address, plan.on);
+            await writeCoil(bridge, agentAddress, deviceName, plan.address, plan.on);
             break;
           case "single":
-            await writeSingleRegister(bridge, agentAddress, interfaceName, plan.address, plan.word);
+            await writeSingleRegister(bridge, agentAddress, deviceName, plan.address, plan.word);
             break;
           case "multi":
-            await writeRegisters(bridge, agentAddress, interfaceName, plan.address, plan.words);
+            await writeRegisters(bridge, agentAddress, deviceName, plan.address, plan.words);
             break;
         }
         // No poll stands behind a raw row, so the read-back is the only receipt.
@@ -485,12 +507,13 @@ function RawRegisterRowView({
           onChange={(e) => editAddress(e.target.value)}
           onBlur={(e) => editAddress(e.target.value)}
           aria-label="Raw address"
-          title="Address — decimal or 0x hex"
+          title={`Address: ${addressBase}-based, decimal or 0x hex`}
           className={cn(
             "h-6 w-full px-1.5 font-mono text-[11px]",
-            !addressReady && "border-destructive ring-1 ring-destructive",
+            (!addressReady || baseError !== null) && "border-destructive ring-1 ring-destructive",
           )}
         />
+        {baseError !== null && <div className="text-[10px] text-destructive">{baseError}</div>}
       </Td>
       <Td>
         <RowSelect
@@ -531,8 +554,8 @@ function RawRegisterRowView({
               onChange={(next) => {
                 if (isByteOrder(next)) patch({ byte_order: next });
               }}
-              label="Raw word order"
-              title={`Word order — ${row.byte_order} (${BYTE_ORDER_LABELS[row.byte_order]})`}
+              label="Byte order"
+              title={`Byte order: ${row.byte_order} (${BYTE_ORDER_LABELS[row.byte_order]})`}
               className="shrink-0"
             />
           )}
@@ -547,15 +570,19 @@ function RawRegisterRowView({
         onRead={() => run("read", performRead)}
         readLabel={`Read ${label} from the device now`}
       />
-      <WriteCell
-        model={rawWriteModel(row)}
-        state={state}
-        label={label}
-        busy={blocked}
-        initialDraft={row.draft ?? ""}
-        onDraftChange={(draft) => patch({ draft })}
-        onWrite={handleWrite}
-      />
+      {rawWrites || !isWritableTable(row.table) ? (
+        <WriteCell
+          model={rawWriteModel(row)}
+          state={state}
+          label={label}
+          busy={blocked}
+          initialDraft={row.draft ?? ""}
+          onDraftChange={(draft) => patch({ draft })}
+          onWrite={handleWrite}
+        />
+      ) : (
+        <Td className="text-[10px] text-muted-foreground">{RAW_WRITES_OFF}</Td>
+      )}
       <Td>
         <RemoveButton label={label} disabled={busy !== null} onRemove={() => onRemoveRow(row.id)} />
       </Td>

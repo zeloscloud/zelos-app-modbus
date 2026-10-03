@@ -17,13 +17,14 @@ import {
   isBooleanRegister,
   isRepresentable,
   isWritableTable,
-  type DecodedValue,
+  type DisplayValue,
   type WriteWire,
 } from "./codec";
 import type {
   ByteOrder,
   ModbusDatatype,
   ModbusSnapshot,
+  NamedValue,
   RegisterEntry,
   RegisterTableType,
 } from "./types";
@@ -34,7 +35,7 @@ import {
   type RawWatchRow,
 } from "./watch-store";
 
-/** Staleness cutoff when the effective poll interval is unknown or disabled. */
+/** Staleness cutoff when the poll rate is unknown or disabled. */
 const DEFAULT_STALE_MS = 5_000;
 
 export const TABLE_LABELS: Record<RegisterTableType, string> = {
@@ -44,7 +45,7 @@ export const TABLE_LABELS: Record<RegisterTableType, string> = {
   discrete_input: "discrete",
 };
 
-/** Device documentation writes word order as a byte pattern, and it fits a table
+/** Device documentation writes byte order as a byte pattern, and it fits a table
  *  cell in a way `little_swap` never will. Same permutations as `reorderWords`. */
 export const BYTE_ORDER_LABELS: Record<ByteOrder, string> = {
   big: "AB CD",
@@ -64,8 +65,7 @@ export type ValueSource = "poll" | "read";
  *  compared with anything: `ts_ms` is agent-clock, and the only other agent-clock
  *  reading available is the snapshot's own `captured_at_unix_ms`. */
 export type ResolvedValue =
-  | { source: "poll"; value: number | boolean | null; ts_ms: number }
-  | { source: "read"; value: number | boolean | null };
+  { source: "poll"; value: NamedValue; ts_ms: number } | { source: "read"; value: NamedValue };
 
 /** A value fetched on demand, and the poll sample it was taken against.
  *
@@ -76,7 +76,7 @@ export type ResolvedValue =
  *  comparing that to agent time was the bug: a browser running behind the agent
  *  would pin the row to its read for as long as the skew lasted. */
 export interface OverlayEntry {
-  value: number | boolean | null;
+  value: NamedValue;
   supersedes: number | null;
 }
 
@@ -90,7 +90,7 @@ export type Overlay = Readonly<Record<string, OverlayEntry>>;
 export type ValueState =
   | { kind: "never" }
   | { kind: "unrepresentable"; context?: string }
-  | { kind: "value"; value: DecodedValue; stale: boolean; source: ValueSource; context?: string };
+  | { kind: "value"; value: DisplayValue; stale: boolean; source: ValueSource; context?: string };
 
 /** The on-demand read, until the poll produces something newer than the sample
  *  that read was taken against. */
@@ -111,7 +111,7 @@ export function resolveValue(
 function pollSupersedes(read: OverlayEntry, polled: { ts_ms: number } | undefined): boolean {
   if (polled === undefined) return false;
   // Nothing was polled when the read happened, so the first sample to arrive is
-  // news — however it is stamped. A register with `poll_interval: 0` never
+  // news — however it is stamped. A register with `rate: 0` never
   // produces one, which is exactly why the read has to hold there forever.
   if (read.supersedes === null) return true;
   // Strictly newer: the same sample the read was taken against is not an update,
@@ -148,10 +148,11 @@ export function rawValueState(readout: RawReadout | null): ValueState {
 }
 
 /** The value the write editor may offer as its placeholder. Nothing the user
- *  can't retype belongs there: no missing sample, no unrepresentable one, and no
- *  64-bit integer (the editor works in `number`). */
+ *  can't retype belongs there: no missing sample, no unrepresentable one, no
+ *  64-bit integer (the editor works in `number`), and no string. */
 export function writeDefault(state: ValueState): number | boolean | null {
   if (state.kind !== "value" || typeof state.value === "bigint") return null;
+  if (typeof state.value === "string") return null;
   return state.value;
 }
 
@@ -169,13 +170,9 @@ export function sameValueState(a: ValueState, b: ValueState): boolean {
   return true;
 }
 
-/** ~3× the effective poll interval, falling back to 5 s when the interval is
- *  unknown or polling is disabled. */
-export function stalenessThresholdMs(
-  registerPollInterval: number | null,
-  interfacePollInterval: number,
-): number {
-  const seconds = registerPollInterval ?? interfacePollInterval;
+/** ~3× the register's poll rate, falling back to 5 s when the rate is unknown
+ *  or polling is disabled. */
+export function stalenessThresholdMs(seconds: number): number {
   if (!Number.isFinite(seconds) || seconds <= 0) return DEFAULT_STALE_MS;
   return Math.max(3 * seconds * 1000, 1500);
 }
@@ -189,6 +186,8 @@ function isStale(ts_ms: number, thresholdMs: number, snapshotCapturedAt: number 
 
 // ─── Write ──────────────────────────────────────────────────────────────────
 
+export const STRING_READ_ONLY_REASON = "string registers are read-only";
+
 /** What the Write cell offers for a row, and what to validate against.
  *
  *  `blind` is the honest state when the catalog is unreachable: a named write only
@@ -201,6 +200,8 @@ export type WriteModel =
   | { kind: "blind" };
 
 export function namedWriteModel(reg: RegisterEntry): WriteModel {
+  // The extension refuses to encode a string, whatever the map says.
+  if (reg.datatype === "string") return { kind: "readonly", why: STRING_READ_ONLY_REASON };
   if (!reg.writable) {
     // Two different facts, two different fixes: the protocol forbids writing this
     // table, or the map marks this particular register read-only.
@@ -230,7 +231,7 @@ export function rawWriteModel(row: RawWatchRow): WriteModel {
 
 // ─── Metadata ───────────────────────────────────────────────────────────────
 
-/** The Type cell for a named row: the datatype, annotated with the word order
+/** The Type cell for a named row: the datatype, annotated with the byte order
  *  when it isn't `big` and the scale when it isn't 1 — `int16 ×0.1`. The table
  *  and the unit have their own columns, so neither appears here. */
 export function typeSummary(reg: RegisterEntry): string {

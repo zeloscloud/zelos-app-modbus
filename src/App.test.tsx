@@ -32,7 +32,7 @@ vi.mock("@zeloscloud/app-extension-sdk/react", () => ({
 
 import { App, strandedRows } from "./App";
 import type { AgentStatus } from "@/lib/capability";
-import type { ModbusInterfaceEntry } from "@/lib/types";
+import { deviceEntry } from "@/components/__tests__/register-fixtures";
 import type { WatchRow } from "@/lib/watch-store";
 
 function withQueryClient(children: React.ReactNode) {
@@ -54,52 +54,41 @@ describe("App", () => {
 });
 
 describe("strandedRows", () => {
-  const iface = (name: string): ModbusInterfaceEntry => ({
-    name,
-    transport: "tcp",
-    connected: true,
-    connection: "127.0.0.1:502",
-    unit_id: 1,
-    source: "config.json",
-    map_name: "power_meter",
-    register_count: 1,
-    poll_interval: 1,
-    write_mode: "auto",
-  });
+  const device = (name: string) => deviceEntry({ name: `meter_panel/${name}`, device: name });
 
-  const row = (agent: string, ifaceName: string): WatchRow => ({
-    id: `${agent}-${ifaceName}`,
+  const row = (agent: string, name: string): WatchRow => ({
+    id: `${agent}-${name}`,
     kind: "named",
     agent,
-    interface: ifaceName,
+    device: `meter_panel/${name}`,
     path: "power/total",
   });
 
   const ready: AgentStatus = {
     agent: "localhost",
     kind: "ready",
-    interfaces: [iface("meter")],
+    devices: [device("unit1")],
   };
 
-  it("leaves a row alone while its interface is on screen", () => {
-    expect(strandedRows([row("localhost", "meter")], [ready])).toEqual([]);
+  it("leaves a row alone while its device is on screen", () => {
+    expect(strandedRows([row("localhost", "unit1")], [ready])).toEqual([]);
   });
 
-  it("surfaces a row whose interface isn't rendered anywhere", () => {
-    const gone = row("localhost", "probe");
-    expect(strandedRows([row("localhost", "meter"), gone], [ready])).toEqual([gone]);
+  it("surfaces a row whose device isn't rendered anywhere", () => {
+    const gone = row("localhost", "unit2");
+    expect(strandedRows([row("localhost", "unit1"), gone], [ready])).toEqual([gone]);
   });
 
   it("surfaces a row whose agent isn't there at all", () => {
-    const other = row("remote:2300", "meter");
+    const other = row("remote:2300", "unit1");
     expect(strandedRows([other], [ready])).toEqual([other]);
   });
 
-  it("surfaces every row while an agent has no interfaces to show yet", () => {
+  it("surfaces every row while an agent has no devices to show yet", () => {
     // An agent that never resolves is exactly the case worth surfacing — its
     // rows would otherwise be invisible and undeletable.
     const stopped: AgentStatus = { agent: "localhost", kind: "extension-stopped" };
-    const rows = [row("localhost", "meter")];
+    const rows = [row("localhost", "unit1")];
     expect(strandedRows(rows, [stopped])).toEqual(rows);
   });
 });

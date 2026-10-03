@@ -1,4 +1,4 @@
-/** localStorage-backed rows for an interface's one register table, plus the pure
+/** localStorage-backed rows for a device's one register table, plus the pure
  *  "what request would this raw row issue" planners.
  *
  *  Two kinds of row share one list, one storage key and one insertion order:
@@ -11,9 +11,6 @@
  *  - **raw** rows are arbitrary-address access. The agent knows nothing about
  *    them, so they carry their OWN metadata (address, table, datatype, word
  *    order) and their values are decoded client-side by `lib/codec`.
- *
- *  Rows persisted before raw rows existed have no `kind` and load as `named`, so
- *  an existing table survives the upgrade untouched.
  *
  *  `address` is stored as the STRING the user typed (`"100"` or `"0x64"`) and
  *  parsed at request time, so the field round-trips through an edit without
@@ -32,20 +29,30 @@ import {
   isModbusDatatype,
   isRegisterTableType,
   isWritableTable,
+  maxAddress,
   parseAddress,
   readWordCount,
   type DecodedValue,
 } from "./codec";
-import type { ByteOrder, ModbusDatatype, RawReadResult, RegisterTableType } from "./types";
+import type {
+  AddressBase,
+  ByteOrder,
+  ModbusDatatype,
+  RawReadResult,
+  RegisterTableType,
+} from "./types";
 import { errorMessage } from "./utils";
 
-const STORAGE_KEY = "zelos-app-modbus.watch-rows.v1";
+// v1 rows are intentionally not migrated: their raw addresses were 0-based wire
+// addresses, so carrying them over would be off by one on a 1-based device.
+const STORAGE_KEY = "zelos-app-modbus.watch-rows.v2";
 
 interface RowIdentity {
   /** Stable local id. Generated client-side so localStorage owns identity. */
   id: string;
   agent: string;
-  interface: string;
+  /** `<connection>/<device>`. */
+  device: string;
   /** The write editor's text, kept as typed. Persisted so a row can act as a
    *  one-click preset: several rows on the same register, each holding the value
    *  it writes. Absent on rows saved before presets existed. */
@@ -62,8 +69,11 @@ export interface NamedWatchRow extends RowIdentity {
 
 export interface RawWatchRow extends RowIdentity {
   kind: "raw";
-  /** As typed — decimal or `0x` hex. */
+  /** As typed (decimal or `0x` hex), in {@link base}. */
   address: string;
+  /** The device's address base when the row was created. The address means
+   *  nothing under another base, so a change blocks the row until re-entered. */
+  base: AddressBase;
   table: RegisterTableType;
   /** Bit tables are always `bool`; {@link patchRow} keeps that true. */
   datatype: ModbusDatatype;
@@ -79,15 +89,17 @@ export type NewWatchRow = WithoutId<WatchRow>;
 /** An inline edit. `draft` applies to either kind of row; the rest describe a
  *  raw row's own metadata and are ignored on a named row, which owns none. */
 export type RowPatch = { draft?: string } & Partial<
-  Pick<RawWatchRow, "address" | "table" | "datatype" | "byte_order">
+  Pick<RawWatchRow, "address" | "base" | "table" | "datatype" | "byte_order">
 >;
 
-export function defaultRawRow(agent: string, iface: string): NewWatchRow {
+/** Starts at the device's first address. */
+export function defaultRawRow(agent: string, device: string, base: AddressBase): NewWatchRow {
   return {
     kind: "raw",
     agent,
-    interface: iface,
-    address: "0",
+    device,
+    address: String(base),
+    base,
     table: "holding",
     datatype: "uint16",
     byte_order: "big",
@@ -171,29 +183,30 @@ export function saveRows(rows: readonly WatchRow[]): void {
   }
 }
 
-/** One stored entry → a row, or null if it isn't usable. A row without a `kind`
- *  predates raw rows and is therefore named; a raw row falls back to the
- *  defaults for any field that no longer parses. */
+/** One stored entry → a row, or null if it isn't usable. A raw row falls back to
+ *  the defaults for any field that no longer parses. */
 function reviveRow(entry: unknown): WatchRow | null {
   if (entry === null || typeof entry !== "object") return null;
   const r = entry as Record<string, unknown>;
-  if (typeof r.id !== "string" || typeof r.agent !== "string" || typeof r.interface !== "string") {
+  if (typeof r.id !== "string" || typeof r.agent !== "string" || typeof r.device !== "string") {
     return null;
   }
   const identity: RowIdentity = {
     id: r.id,
     agent: r.agent,
-    interface: r.interface,
+    device: r.device,
     ...(typeof r.draft === "string" ? { draft: r.draft } : {}),
   };
 
   if (r.kind === "raw") {
     if (typeof r.address !== "string" || r.address.length === 0) return null;
+    if (r.base !== 0 && r.base !== 1) return null;
     return patchRow(
       {
         ...identity,
         kind: "raw",
         address: r.address,
+        base: r.base,
         table: isRegisterTableType(r.table) ? r.table : "holding",
         datatype: isModbusDatatype(r.datatype) ? r.datatype : "uint16",
         byte_order: isByteOrder(r.byte_order) ? r.byte_order : "big",
@@ -202,7 +215,7 @@ function reviveRow(entry: unknown): WatchRow | null {
     );
   }
 
-  if (typeof r.path !== "string" || r.path.length === 0) return null;
+  if (r.kind !== "named" || typeof r.path !== "string" || r.path.length === 0) return null;
   return { ...identity, kind: "named", path: r.path };
 }
 
@@ -218,8 +231,8 @@ export interface RawReadPlan {
 }
 
 /** Which call to make, decided here rather than at the call site: FC5 for a bit,
- *  FC6 for one word (matching the extension's own `auto` write mode), FC16 for
- *  more than one. */
+ *  FC6 for one word, FC16 for more than one or for any word under the device's
+ *  `fc16` write mode (as client.py does). */
 export type RawWritePlan =
   | { kind: "coil"; address: number; on: boolean }
   | { kind: "single"; address: number; word: number }
@@ -247,31 +260,37 @@ export const MAP_READ_ONLY_REASON = "this register is marked read-only in the ma
 /** Everything about a raw row that decides which device value it names. A readout
  *  taken before any of it changed is no longer about this row's target. */
 export function rawTargetKey(row: RawWatchRow): string {
-  return `${row.address}|${row.table}|${row.datatype}|${row.byte_order}`;
+  return `${row.base}|${row.address}|${row.table}|${row.datatype}|${row.byte_order}`;
 }
 
 /** The single-value read a raw row stands for, or the reason it can't be
  *  issued. Every validation the UI shows lives here so the inline error and the
- *  wire call can never disagree. */
-export function planRawRead(row: RawWatchRow): Planned<RawReadPlan> {
-  const address = parseAddress(row.address);
-  if (address === null) return { ok: false, error: addressError(row.address) };
+ *  wire call can never disagree. `base` is the device's current address base;
+ *  the plan's address stays in it. */
+export function planRawRead(row: RawWatchRow, base: AddressBase): Planned<RawReadPlan> {
+  if (row.base !== base) return { ok: false, error: baseChangedError(row.base, base) };
+  const address = parseAddress(row.address, base);
+  if (address === null) return { ok: false, error: addressError(row.address, base) };
   const count = readWordCount(row.table, row.datatype, 1);
-  if (address + count - 1 > 65535) {
-    return { ok: false, error: "The read runs past address 65535" };
+  if (address + count - 1 > maxAddress(base)) {
+    return { ok: false, error: `The read runs past address ${maxAddress(base)}` };
   }
   return { ok: true, plan: { address, table: row.table, count } };
 }
 
 /** The write a raw row would issue for `value`: a coil bit, or the encoded words
  *  for its datatype and word order. Raw writes are unscaled, and a `bigint` is
- *  encoded exactly — client-side words never go through a JSON number. */
+ *  encoded exactly — client-side words never go through a JSON number. `base`
+ *  and `writeMode` are the device's current `address_base` and `write_mode`. */
 export function planRawWrite(
   row: RawWatchRow,
   value: number | boolean | bigint,
+  base: AddressBase,
+  writeMode: string,
 ): Planned<RawWritePlan> {
-  const address = parseAddress(row.address);
-  if (address === null) return { ok: false, error: addressError(row.address) };
+  if (row.base !== base) return { ok: false, error: baseChangedError(row.base, base) };
+  const address = parseAddress(row.address, base);
+  if (address === null) return { ok: false, error: addressError(row.address, base) };
   if (!isWritableTable(row.table)) return { ok: false, error: readOnlyReason(row.table) };
   if (isBitTable(row.table)) {
     return {
@@ -290,11 +309,11 @@ export function planRawWrite(
   } catch (e) {
     return { ok: false, error: errorMessage(e) };
   }
-  if (address + words.length - 1 > 65535) {
-    return { ok: false, error: "The write runs past address 65535" };
+  if (address + words.length - 1 > maxAddress(base)) {
+    return { ok: false, error: `The write runs past address ${maxAddress(base)}` };
   }
   const [first] = words;
-  if (words.length === 1 && first !== undefined) {
+  if (words.length === 1 && first !== undefined && writeMode !== "fc16") {
     return { ok: true, plan: { kind: "single", address, word: first } };
   }
   return { ok: true, plan: { kind: "multi", address, words } };
@@ -337,6 +356,10 @@ export function interpretRawRead(row: RawWatchRow, res: RawReadResult): RawReado
   };
 }
 
-function addressError(address: string): string {
-  return `Address "${address}" is not a value in 0…65535 (dec or 0x)`;
+export function baseChangedError(was: AddressBase, now: AddressBase): string {
+  return `address base changed ${was}->${now}; re-enter the address`;
+}
+
+function addressError(address: string, base: AddressBase): string {
+  return `Address "${address}" is not a value in ${base}…${maxAddress(base)} (dec or 0x)`;
 }

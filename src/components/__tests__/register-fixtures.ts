@@ -4,7 +4,7 @@
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 
-import type { ModbusSnapshot, RegisterEntry, SnapshotValue } from "@/lib/types";
+import type { ModbusDeviceEntry, ModbusSnapshot, RegisterEntry, SnapshotValue } from "@/lib/types";
 import type { NamedWatchRow, RawWatchRow, WatchRow } from "@/lib/watch-store";
 
 /** A holding-register float by default; `path` is derived from event + name so
@@ -24,7 +24,7 @@ export function register(overrides: Partial<RegisterEntry> = {}): RegisterEntry 
     description: "",
     writable: true,
     byte_order: "big",
-    poll_interval: null,
+    rate: 1,
     ...overrides,
   };
 }
@@ -34,16 +34,60 @@ export function snapshot(
   capturedAtUnixMs = 1_700_000_000_000,
 ): ModbusSnapshot {
   return {
-    interface: "meter",
+    device: "meter_panel/unit1",
+    connection: "meter_panel",
     connected: true,
     transport: "tcp",
-    connection: "127.0.0.1:502",
+    endpoint: "127.0.0.1:502",
     unit_id: 1,
     poll_count: 42,
-    error_count: 0,
+    address_base: 1,
     captured_at_unix_ms: capturedAtUnixMs,
+    requested_rate: 1,
+    achieved_rate: 1,
+    overload_pct: 0,
+    tiers: [{ requested_rate: 1, achieved_rate: 1, overload_pct: 0, blocks: 1 }],
+    successful_reads: 42,
+    failed_reads: 0,
+    demoted: false,
+    retry_in_s: null,
+    refused: [],
+    error: null,
+    map_pending: false,
     values,
     success: true,
+  };
+}
+
+/** A `list_devices` row: unit1 of a mapped TCP meter by default. */
+export function deviceEntry(overrides: Partial<ModbusDeviceEntry> = {}): ModbusDeviceEntry {
+  return {
+    name: "meter_panel/unit1",
+    connection: "meter_panel",
+    device: "unit1",
+    unit_id: 1,
+    transport: "tcp",
+    endpoint: "127.0.0.1:5020",
+    connected: true,
+    trace_path: "Modbus/meter_panel/unit1",
+    map_name: "power_meter",
+    address_base: 1,
+    register_count: 24,
+    rate: 1,
+    requested_rate: 1,
+    achieved_rate: 1,
+    overload_pct: 0,
+    tiers: [],
+    successful_reads: 0,
+    failed_reads: 0,
+    demoted: false,
+    retry_in_s: null,
+    refused: [],
+    error: null,
+    map_pending: false,
+    write_mode: "auto",
+    raw_writes: true,
+    ...overrides,
   };
 }
 
@@ -54,21 +98,21 @@ let nextId = 0;
 /** One named row, optionally carrying a persisted write draft. */
 export function namedRow(
   path: string,
-  extra: { draft?: string; iface?: string } = {},
+  extra: { draft?: string; device?: string } = {},
 ): NamedWatchRow {
   return {
     id: `named-${(nextId += 1)}`,
     kind: "named",
     agent: "localhost:2300",
-    interface: extra.iface ?? "meter",
+    device: extra.device ?? "meter_panel/unit1",
     path,
     ...(extra.draft === undefined ? {} : { draft: extra.draft }),
   };
 }
 
 /** Named rows in the order given — the table renders insertion order. */
-export function watchRows(paths: readonly string[], iface = "meter"): WatchRow[] {
-  return paths.map((path) => namedRow(path, { iface }));
+export function watchRows(paths: readonly string[], device = "meter_panel/unit1"): WatchRow[] {
+  return paths.map((path) => namedRow(path, { device }));
 }
 
 /** A raw row, defaulting to the shape "Add raw row" creates. */
@@ -77,8 +121,9 @@ export function rawRow(overrides: Partial<Omit<RawWatchRow, "id" | "kind">> = {}
     id: `raw-${(nextId += 1)}`,
     kind: "raw",
     agent: "localhost:2300",
-    interface: "meter",
-    address: "0",
+    device: "meter_panel/unit1",
+    address: "1",
+    base: 1,
     table: "holding",
     datatype: "uint16",
     byte_order: "big",
@@ -91,7 +136,7 @@ export function rawRow(overrides: Partial<Omit<RawWatchRow, "id" | "kind">> = {}
  *  the tests that never fire a read or a write need.
  *
  *  Pass `onExecute` to answer `actions.execute` for real: it receives the Modbus
- *  action path (`modbus/write_named_register`) plus its params and returns the
+ *  action path (`Modbus/write_named_register`) plus its params and returns the
  *  action's `result` payload, which the stub wraps in the `status: "done"`
  *  envelope the extension sends. */
 export function bridgeStub(

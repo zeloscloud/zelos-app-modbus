@@ -15,9 +15,10 @@ import { RegisterTable } from "../RegisterTable";
 import { bridgeStub, namedRow, rawRow, register, snapshot, watchRows } from "./register-fixtures";
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import type { ModbusSnapshot, RegisterEntry } from "@/lib/types";
+import { WRITE_UNKNOWN_MESSAGE } from "@/lib/errors";
 import { patchRow, type RawWatchRow, type WatchRow } from "@/lib/watch-store";
 
-vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }));
 
 const CATALOG: readonly RegisterEntry[] = [
   register({ event: "power", name: "total", address: 12, unit: "kW" }),
@@ -45,7 +46,7 @@ const CATALOG: readonly RegisterEntry[] = [
     address: 104,
     datatype: "uint32",
     unit: "",
-    poll_interval: 0,
+    rate: 0,
   }),
   register({
     event: "control",
@@ -74,6 +75,8 @@ interface TableOptions {
   registers?: readonly RegisterEntry[];
   /** Defaults to true: most tests are about a table whose catalog loaded. */
   catalogReady?: boolean;
+  /** The device's `raw_writes`; defaults to true. */
+  rawWrites?: boolean;
   snap?: ModbusSnapshot;
   bridge?: BridgeTransport;
   onRemoveRow?: (id: string) => void;
@@ -97,8 +100,10 @@ function renderTable(opts: TableOptions) {
       <RegisterTable
         bridge={bridge}
         agentAddress="localhost:2300"
-        interfaceName="meter"
-        interfacePollInterval={1}
+        deviceName="meter"
+        addressBase={1}
+        writeMode="auto"
+        rawWrites={opts.rawWrites ?? true}
         registers={registers}
         rows={rows}
         catalogReady={opts.catalogReady ?? true}
@@ -159,6 +164,7 @@ function readAnswerer(value: number | boolean): BridgeTransport {
 beforeEach(() => {
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
+  vi.mocked(toast.warning).mockClear();
 });
 
 describe("RegisterTable empty state", () => {
@@ -282,7 +288,7 @@ describe("RegisterTable rows", () => {
     expect(cell(row, COL.unit)).toHaveTextContent("°C");
   });
 
-  it("hints that a poll_interval: 0 register is not polled", () => {
+  it("hints that a rate: 0 register is not polled", () => {
     renderTable({ rows: watchRows(["setpoints/energy_reset"]), snap: snapshot({}) });
     expect(screen.getByText("not polled")).toBeInTheDocument();
   });
@@ -399,7 +405,7 @@ describe("RegisterTable unrepresentable values", () => {
    *  carry — what the extension sends for a NaN or ±Inf off the wire. */
   function nullValueBridge(actions: string[] = []): BridgeTransport {
     return bridgeStub((action) => {
-      actions.push(action.replace(/^modbus\//, ""));
+      actions.push(action.replace(/^Modbus\//, ""));
       return {
         name: "power/total",
         address: 12,
@@ -496,11 +502,11 @@ describe("RegisterTable unrepresentable values", () => {
 describe("RegisterTable write draft", () => {
   /** Answers `write_named_register` and records what was sent. `fail` makes the
    *  extension report its in-band failure instead. */
-  function writeRecorder(sent: number[], fail = false): BridgeTransport {
+  function writeRecorder(sent: number[], failure?: Record<string, unknown>): BridgeTransport {
     return bridgeStub((action, params) => {
       if (!action.endsWith("write_named_register")) throw new Error(`unexpected action ${action}`);
       sent.push(Number(params.value));
-      if (fail) return { success: false, error: "unit_id out of range" };
+      if (failure) return { success: false, ...failure };
       return { name: String(params.name), value: Number(params.value), success: true };
     });
   }
@@ -557,17 +563,26 @@ describe("RegisterTable write draft", () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
-  it("still toasts when a write fails", async () => {
+  it.each([
+    ["refused", toast.error, "Write power/total failed", "unit_id out of range"],
+    ["unknown", toast.warning, "Write power/total: no response", WRITE_UNKNOWN_MESSAGE],
+  ])("toasts a %s write with its reason", async (outcome, notify, title, description) => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const sent: number[] = [];
-    renderTable({ rows: watchRows(["power/total"]), bridge: writeRecorder(sent, true) });
+    const failure = { outcome, error: "unit_id out of range" };
+    renderTable({ rows: watchRows(["power/total"]), bridge: writeRecorder(sent, failure) });
     fireEvent.change(screen.getByLabelText("New value for power/total"), {
       target: { value: "12.5" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Write" }));
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalledTimes(1));
-    expect(vi.mocked(toast.error).mock.calls[0]?.[0]).toBe("Write power/total failed");
+    await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(notify).mock.calls[0]?.[0]).toBe(title);
+    expect(vi.mocked(notify).mock.calls[0]?.[1]?.description).toBe(description);
+    // Exactly one toast: amber for unknown, red for refused.
+    expect(
+      vi.mocked(toast.error).mock.calls.length + vi.mocked(toast.warning).mock.calls.length,
+    ).toBe(1);
     expect(toast.success).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
@@ -604,9 +619,9 @@ describe("RegisterTable raw rows", () => {
     });
   }
 
-  /** The actions issued, in order, without the `modbus/` prefix. */
+  /** The actions issued, in order, without the `Modbus/` prefix. */
   function actions(calls: RawCall[]): string[] {
-    return calls.map((c) => c.action.replace(/^modbus\//, ""));
+    return calls.map((c) => c.action.replace(/^Modbus\//, ""));
   }
 
   function select(row: HTMLElement, name: string): HTMLSelectElement {
@@ -615,13 +630,21 @@ describe("RegisterTable raw rows", () => {
     return el;
   }
 
+  it("disables raw writes with the reason inline when the device has them off, reads unaffected", () => {
+    renderTable({ rows: [rawRow()], rawWrites: false });
+    const write = cell(bodyRow(), COL.write);
+    expect(write).toHaveTextContent("raw writes are off");
+    expect(within(write).queryByRole("button", { name: "Write" })).toBeNull();
+    expect(within(cell(bodyRow(), COL.value)).getByRole("button")).toBeEnabled();
+  });
+
   it("dashes the two columns an arbitrary address has no answer for", () => {
     renderTable({ rows: [rawRow()] });
     const row = bodyRow();
     expect(cell(row, COL.register)).toHaveTextContent("—");
     expect(cell(row, COL.unit)).toHaveTextContent("—");
     // …and puts an editor in each of the three it does.
-    expect(within(cell(row, COL.address)).getByLabelText("Raw address")).toHaveValue("0");
+    expect(within(cell(row, COL.address)).getByLabelText("Raw address")).toHaveValue("1");
     expect(select(row, "Raw table")).toHaveValue("holding");
     expect(select(row, "Raw datatype")).toHaveValue("uint16");
   });
@@ -659,12 +682,12 @@ describe("RegisterTable raw rows", () => {
     expect(select(bodyRow(), "Raw datatype")).toBeEnabled();
   });
 
-  it("offers a word-order select only where word order can matter", () => {
+  it("offers a byte-order select only where byte order can matter", () => {
     const view = renderTable({ rows: [rawRow({ datatype: "uint16" })] });
-    expect(within(bodyRow()).queryByLabelText("Raw word order")).not.toBeInTheDocument();
+    expect(within(bodyRow()).queryByLabelText("Byte order")).not.toBeInTheDocument();
 
     fireEvent.change(select(bodyRow(), "Raw datatype"), { target: { value: "float32" } });
-    const order = select(bodyRow(), "Raw word order");
+    const order = select(bodyRow(), "Byte order");
     expect(order).toHaveValue("big");
     fireEvent.change(order, { target: { value: "big_swap" } });
     expect(storedRaw(view).byte_order).toBe("big_swap");
@@ -862,7 +885,7 @@ describe("RegisterTable without a catalog", () => {
   it("sends an unvalidated write and lets the extension have the last word", async () => {
     const sent: unknown[] = [];
     const bridge = bridgeStub((action, params) => {
-      sent.push({ action: action.replace(/^modbus\//, ""), value: params.value });
+      sent.push({ action: action.replace(/^Modbus\//, ""), value: params.value });
       return { name: "power/total", value: params.value, success: true };
     });
     renderUnjoined(bridge);
@@ -892,7 +915,7 @@ describe("RegisterTable row locking", () => {
       release = r;
     });
     const bridge = bridgeStub((action, params) => {
-      calls.push(action.replace(/^modbus\//, ""));
+      calls.push(action.replace(/^Modbus\//, ""));
       return gate.then(() => ({ name: "power/total", value: params.value ?? 1, success: true }));
     });
     return { bridge, resolve: () => release(), calls };

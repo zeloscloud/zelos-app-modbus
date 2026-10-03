@@ -1,6 +1,6 @@
 /** Top-level banner — shown only when discovery itself is disabled.
  *
- *  Per-agent issues (extension missing, stopped, outdated, no interfaces) live
+ *  Per-agent issues (extension missing, stopped, outdated, no devices) live
  *  in the agent cards. This banner covers the two cases that aren't
  *  agent-specific: workspace not LIVE, and zero agents connected at all. */
 

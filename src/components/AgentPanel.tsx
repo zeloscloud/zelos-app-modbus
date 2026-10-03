@@ -1,16 +1,16 @@
 /** One panel per discovered agent. Header shows the agent address, a status
- *  badge, the Modbus extension version and a start/stop toggle; the body is one
- *  InterfacePanel per interface the extension reported. */
+ *  badge, the Modbus extension version and a start/stop toggle; the body groups
+ *  the extension's devices by connection, one DevicePanel per device. */
 
 import { extensions, type BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { Loader2, Play, Square } from "lucide-react";
 
-import { InterfacePanel } from "@/components/InterfacePanel";
+import { DevicePanel } from "@/components/DevicePanel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAction } from "@/hooks/use-action";
-import { remediation, type AgentStatus } from "@/lib/capability";
+import { groupByConnection, remediation, type AgentStatus } from "@/lib/capability";
 import type { NewWatchRow, RowPatch, WatchRow } from "@/lib/watch-store";
 
 export interface AgentPanelProps {
@@ -34,9 +34,9 @@ export function AgentPanel({
   onRemoveRow,
   onRefresh,
 }: AgentPanelProps) {
-  // `interfaces` is only ever populated on a ready agent, so the kind check the
+  // `devices` is only ever populated on a ready agent, so the kind check the
   // resolver already made doesn't need making again here.
-  const interfaces = agent.interfaces ?? [];
+  const connections = groupByConnection(agent.devices ?? []);
   const fixIt = remediation(agent);
 
   return (
@@ -63,6 +63,19 @@ export function AgentPanel({
           )}
         </div>
 
+        {agent.ambiguousInstalls && (
+          <p
+            role="alert"
+            className="rounded border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            {agent.ambiguousInstalls.length} Modbus extensions are running on this agent (
+            {agent.ambiguousInstalls.map((e) => `${e.id} v${e.version}`).join(", ")}). The agent
+            does not report which one serves reads and writes, and the Start/Stop button above only
+            targets <code>{agent.extension?.id}</code>. Stop the one you are not using:{" "}
+            <code className="rounded bg-muted px-1.5 py-0.5">zelos extensions stop &lt;id&gt;</code>
+          </p>
+        )}
+
         {fixIt && <p className="text-xs text-muted-foreground">{fixIt}</p>}
 
         {agent.kind === "extension-outdated" && agent.missingMethods?.length ? (
@@ -71,8 +84,8 @@ export function AgentPanel({
           </pre>
         ) : null}
 
-        {agent.kind === "discovering-interfaces" && (
-          <p className="text-xs text-muted-foreground">Discovering interfaces…</p>
+        {agent.kind === "discovering-devices" && (
+          <p className="text-xs text-muted-foreground">Discovering devices…</p>
         )}
 
         {agent.kind === "extension-starting" && (
@@ -83,20 +96,30 @@ export function AgentPanel({
         )}
       </CardHeader>
 
-      {interfaces.length > 0 && (
+      {connections.length > 0 && (
         <CardContent className="px-3 pt-2 pb-4">
           <div className="flex flex-col gap-4">
-            {interfaces.map((iface) => (
-              <InterfacePanel
-                key={iface.name}
-                bridge={bridge}
-                agentAddress={agent.agent}
-                iface={iface}
-                rows={rows.filter((r) => r.interface === iface.name)}
-                onAddRow={onAddRow}
-                onUpdateRow={onUpdateRow}
-                onRemoveRow={onRemoveRow}
-              />
+            {connections.map((conn) => (
+              <section key={conn.connection} className="flex flex-col gap-2">
+                <div className="flex min-w-0 flex-wrap items-center gap-2 px-1 text-xs">
+                  <strong className="text-sm">{conn.connection}</strong>
+                  <Badge variant="outline" className="font-mono">
+                    {conn.transport.toUpperCase()} {conn.endpoint}
+                  </Badge>
+                </div>
+                {conn.devices.map((device) => (
+                  <DevicePanel
+                    key={device.name}
+                    bridge={bridge}
+                    agentAddress={agent.agent}
+                    device={device}
+                    rows={rows.filter((r) => r.device === device.name)}
+                    onAddRow={onAddRow}
+                    onUpdateRow={onUpdateRow}
+                    onRemoveRow={onRemoveRow}
+                  />
+                ))}
+              </section>
             ))}
           </div>
         </CardContent>
@@ -108,7 +131,7 @@ export function AgentPanel({
 function AgentBadge({ agent }: { agent: AgentStatus }) {
   switch (agent.kind) {
     case "ready":
-    case "discovering-interfaces":
+    case "discovering-devices":
       return null;
     case "extension-starting":
       return (
@@ -121,8 +144,8 @@ function AgentBadge({ agent }: { agent: AgentStatus }) {
       return <Badge variant="warning">extension stopped</Badge>;
     case "extension-outdated":
       return <Badge variant="warning">extension outdated</Badge>;
-    case "no-interfaces":
-      return <Badge variant="warning">no interfaces</Badge>;
+    case "no-devices":
+      return <Badge variant="warning">no devices</Badge>;
     case "discovery-failed":
       return <Badge variant="destructive">discovery failed</Badge>;
     case "nothing-registered":
