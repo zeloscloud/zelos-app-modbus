@@ -17,8 +17,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useRegisters } from "@/hooks/use-registers";
 import { useSnapshot } from "@/hooks/use-snapshot";
-import { isRegisterTableType } from "@/lib/codec";
-import { TABLE_NAMES } from "@/lib/row-view";
 import type { AutoScanStatus, ModbusDeviceEntry, PollHealth, RegisterEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { defaultRawRow, type NewWatchRow, type RowPatch, type WatchRow } from "@/lib/watch-store";
@@ -124,8 +122,7 @@ export function DevicePanel({
             (map.scan.state === "scanning" ? (
               <Badge variant="outline" className="gap-1">
                 <Loader2 className="h-3 w-3 animate-spin" />
-                scanning{map.scan.table !== null && ` ${scanTableName(map.scan.table)}`}…{" "}
-                {map.scan.found} found
+                scanning{map.scan.table !== null && ` ${map.scan.table}`}… {map.scan.found} found
               </Badge>
             ) : (
               <Badge variant="outline">auto-scan: {map.scan.found} found</Badge>
@@ -321,11 +318,6 @@ function ConnectionBadge({ connected, stale }: { connected: boolean; stale: bool
       connected
     </Badge>
   );
-}
-
-/** The extension's table key as its spec name; an unknown key as sent. */
-function scanTableName(table: string): string {
-  return isRegisterTableType(table) ? TABLE_NAMES[table] : table;
 }
 
 function Dot({ className }: { className: string }) {

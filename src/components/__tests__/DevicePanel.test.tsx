@@ -314,9 +314,7 @@ describe("DevicePanel rows section", () => {
 
   it("offers an auto-scanned device's discovered registers as named rows", async () => {
     const { device, update, host } = await renderPanel({ name: "dev_ttyUSB0/scanner" });
-    expect(
-      await screen.findByText("scanning Holding registers (4x, FC03)… 0 found"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("scanning holding… 0 found")).toBeInTheDocument();
     expect(screen.queryByText("raw only")).not.toBeInTheDocument();
 
     // The scan finds a register per tick; list_devices' count refetches the catalog.

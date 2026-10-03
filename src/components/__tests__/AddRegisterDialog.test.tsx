@@ -77,7 +77,7 @@ describe("AddRegisterDialog", () => {
     renderDialog();
     const row = option("temperature");
     expect(within(row).getByText("20 (0x0014)")).toBeInTheDocument();
-    expect(within(row).getByText("Holding 4x")).toBeInTheDocument();
+    expect(within(row).getByText("holding")).toBeInTheDocument();
     expect(within(row).getByText("int16")).toBeInTheDocument();
     expect(within(row).getByText("°C")).toBeInTheDocument();
   });

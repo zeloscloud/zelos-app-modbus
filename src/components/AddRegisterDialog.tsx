@@ -13,7 +13,6 @@ import { Lock, Pencil, Plus } from "lucide-react";
 import * as React from "react";
 
 import { TableBadge } from "@/components/RegisterTable";
-import { TABLE_NAMES } from "@/lib/row-view";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -86,7 +85,7 @@ export const AddRegisterDialog = React.memo(function AddRegisterDialog({
             onAddRaw();
             onOpenChange(false);
           }}
-          title={`Append an arbitrary-address row (${TABLE_NAMES.holding}, uint16, address ${addressBase}) and edit it in the table`}
+          title={`Append an arbitrary-address row (holding, uint16, address ${addressBase}) and edit it in the table`}
         >
           <Plus className="h-3 w-3" />
           Add raw row
