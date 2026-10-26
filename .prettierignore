@@ -1,5 +1,0 @@
-dist/
-node_modules/
-*.tar.gz
-.github/workflows/CI.yml
-.github/workflows/release.yml
