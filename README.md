@@ -25,7 +25,7 @@ datatype and word order edited inline in the row and committed as you go. Raw ro
 behind them: they read on demand (`read_register`, decoded client-side) and write FC6 / FC16 / FC5
 by width and table.
 
-Values are decoded and encoded by `src/lib/codec.ts`, a 1:1 port of the extension's
+Values are decoded and encoded by `web/src/lib/codec.ts`, a 1:1 port of the extension's
 `decode_value` / `encode_value` (including its scaled-integer truncation), so a raw read of a
 mapped address agrees with that register's named read.
 
