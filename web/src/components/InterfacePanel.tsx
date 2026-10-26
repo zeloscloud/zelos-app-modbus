@@ -1,9 +1,7 @@
 /** One section per Modbus interface: a live status header, then the one table
  *  holding every row the user added to it — catalog registers and arbitrary
- *  addresses side by side, in insertion order.
- *
- *  An interface with no register map (`map_name === null`) is not a special case
- *  any more: its catalog is simply empty, so only raw rows can be added to it. */
+ *  addresses side by side, in insertion order. An interface with no register map
+ *  has an empty catalog, so only raw rows can be added to it. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { AlertCircle, Loader2, Plus } from "lucide-react";
@@ -22,6 +20,9 @@ import { defaultRawRow, type NewWatchRow, type RowPatch, type WatchRow } from "@
 /** How long a snapshot response can go unrefreshed before the dot goes amber.
  *  The poll runs at 1 Hz, so 5 s means "several cycles have failed or stalled". */
 const SNAPSHOT_STALE_MS = 5_000;
+
+/** How often the staleness check re-reads the clock. */
+const NOW_TICK_MS = 1_000;
 
 const NO_REGISTERS: readonly RegisterEntry[] = [];
 
@@ -57,8 +58,9 @@ export function InterfacePanel({
 
   const snapshot = snapshotQuery.data;
   const snapshotError = snapshotQuery.error instanceof Error ? snapshotQuery.error : null;
+  const now = useNow(NOW_TICK_MS);
   const stale =
-    snapshotQuery.dataUpdatedAt > 0 && Date.now() - snapshotQuery.dataUpdatedAt > SNAPSHOT_STALE_MS;
+    snapshotQuery.dataUpdatedAt > 0 && now - snapshotQuery.dataUpdatedAt > SNAPSHOT_STALE_MS;
 
   const registers = registersQuery.data?.registers ?? NO_REGISTERS;
   const catalogError = registersQuery.error instanceof Error ? registersQuery.error : null;
@@ -212,6 +214,15 @@ function ConnectionBadge({ connected, stale }: { connected: boolean; stale: bool
       connected
     </Badge>
   );
+}
+
+function useNow(intervalMs: number): number {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
 }
 
 function Dot({ className }: { className: string }) {

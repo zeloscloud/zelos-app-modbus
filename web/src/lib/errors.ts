@@ -1,9 +1,5 @@
-/** Shared failure UX: humanize an agent action error, log it, toast it with a
- *  copy-details escape hatch.
- *
- *  can-tx keeps this private to its AgentPanel; here several call sites need the
- *  same behavior (extension lifecycle, named register read/write, raw rows), so
- *  it lives in one place — reached through `useAction`, not called directly. */
+/** Shared failure UX, reached through `useAction`: humanize an agent action
+ *  error, log it, toast it with a copy-details escape hatch. */
 
 import { toast } from "sonner";
 

@@ -48,7 +48,7 @@ import { errorMessage } from "./utils";
 export type DecodedValue = number | boolean | bigint;
 
 /** Number of 16-bit words each datatype occupies. */
-export const WORD_COUNTS: Readonly<Record<ModbusDatatype, number>> = {
+const WORD_COUNTS: Readonly<Record<ModbusDatatype, number>> = {
   bool: 1,
   uint16: 1,
   int16: 1,

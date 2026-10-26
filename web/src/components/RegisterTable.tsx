@@ -155,7 +155,9 @@ export function RegisterTable({
   // Read through a ref so the callback below can stay identity-stable for the
   // memoized rows while still seeing the current tick.
   const snapshotRef = React.useRef(snapshot);
-  snapshotRef.current = snapshot;
+  React.useLayoutEffect(() => {
+    snapshotRef.current = snapshot;
+  });
 
   const handleOverlay = React.useCallback((path: string, value: number | boolean | null) => {
     // Remember which poll sample this read overtook, in the agent's clock, so

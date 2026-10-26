@@ -107,17 +107,14 @@ describe("loadRows / saveRows", () => {
     expect(loadRows()).toHaveLength(2);
   });
 
-  it("reads a row saved before raw rows existed as a named row", () => {
-    // No `kind`, no `draft` — exactly what the previous version wrote.
+  it("drops a stored row with no kind", () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify([
         { id: "a", agent: "localhost:2300", interface: "meter", path: "power/total" },
       ]),
     );
-    expect(loadRows()).toEqual([
-      { id: "a", agent: "localhost:2300", interface: "meter", kind: "named", path: "power/total" },
-    ]);
+    expect(loadRows()).toEqual([]);
   });
 
   it("falls back to the defaults for a raw row's unreadable fields", () => {
@@ -187,9 +184,9 @@ describe("loadRows / saveRows", () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify([
-        { id: "dup", agent: "a", interface: "i", path: "power/total" },
-        { id: "dup", agent: "a", interface: "i", path: "power/factor" },
-        { id: "other", agent: "a", interface: "i", path: "status/temperature" },
+        { id: "dup", agent: "a", interface: "i", kind: "named", path: "power/total" },
+        { id: "dup", agent: "a", interface: "i", kind: "named", path: "power/factor" },
+        { id: "other", agent: "a", interface: "i", kind: "named", path: "status/temperature" },
       ]),
     );
     const rows = loadRows();
@@ -210,7 +207,7 @@ describe("loadRows / saveRows", () => {
   it("ignores rows written under a different store version", () => {
     window.localStorage.setItem(
       "zelos-app-modbus.watch-rows.v0",
-      JSON.stringify([named({ path: "legacy/row" })]),
+      JSON.stringify([named({ path: "power/total" })]),
     );
     expect(loadRows()).toEqual([]);
   });
@@ -305,7 +302,7 @@ describe("planRawRead", () => {
     expect(plan.ok && plan.plan.count).toBe(1);
   });
 
-  it("rejects an unparseable address", () => {
+  it("rejects an unparsable address", () => {
     expect(planRawRead(raw({ address: "beef" }))).toEqual({
       ok: false,
       error: 'Address "beef" is not a value in 0…65535 (dec or 0x)',
@@ -369,7 +366,7 @@ describe("planRawWrite", () => {
     expect(readOnlyReason("input")).toBe("input registers are read-only");
   });
 
-  it("rejects an unparseable address before it encodes anything", () => {
+  it("rejects an unparsable address before it encodes anything", () => {
     expect(planRawWrite(raw({ address: "" }), 1).ok).toBe(false);
   });
 

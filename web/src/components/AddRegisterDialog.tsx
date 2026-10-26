@@ -53,9 +53,11 @@ export const AddRegisterDialog = React.memo(function AddRegisterDialog({
   const [query, setQuery] = React.useState("");
 
   // Every visit starts from the whole catalog rather than the last search.
-  React.useEffect(() => {
+  const [wasOpen, setWasOpen] = React.useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) setQuery("");
-  }, [open]);
+  }
 
   const groups = React.useMemo(
     () => groupByEvent(filterRegisters(registers, query)),

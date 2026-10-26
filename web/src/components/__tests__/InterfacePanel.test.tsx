@@ -158,13 +158,12 @@ describe("InterfacePanel rows section", () => {
     expect(loadRows().map((r) => r.draft)).toEqual(["10", "20"]);
   });
 
-  it("restores rows saved before raw rows existed, flagging a path the map lost", async () => {
-    // No `kind` field: exactly what the previous version persisted.
+  it("restores saved rows, flagging a path the map lost", async () => {
     window.localStorage.setItem(
       "zelos-app-modbus.watch-rows.v1",
       JSON.stringify([
-        { id: "a", agent: AGENT, interface: "meter", path: "power/total" },
-        { id: "b", agent: AGENT, interface: "meter", path: "retired/register" },
+        { id: "a", agent: AGENT, interface: "meter", kind: "named", path: "power/total" },
+        { id: "b", agent: AGENT, interface: "meter", kind: "named", path: "retired/register" },
       ]),
     );
     await renderPanel();
@@ -175,7 +174,7 @@ describe("InterfacePanel rows section", () => {
     expect(screen.queryByText(/No rows yet/)).not.toBeInTheDocument();
   });
 
-  it("holds named and raw rows in one table, with no tabs to switch between", async () => {
+  it("holds named and raw rows in one table", async () => {
     await renderPanel();
     await screen.findByText(/No rows yet/);
 
@@ -190,9 +189,6 @@ describe("InterfacePanel rows section", () => {
     await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(3));
     expect(screen.getByLabelText("Raw address")).toBeInTheDocument();
     expect(screen.getByText("power/total")).toBeInTheDocument();
-    // The old two-tab section is gone.
-    expect(screen.queryByRole("button", { name: "Raw access" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Registers" })).not.toBeInTheDocument();
   });
 
   it("adds a raw row, edits it inline, writes it, reads it back, then deletes it", async () => {

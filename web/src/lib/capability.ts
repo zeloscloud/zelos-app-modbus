@@ -27,7 +27,7 @@ import {
   type WorkspaceModeKind,
 } from "./types";
 
-export type AgentStatusKind =
+type AgentStatusKind =
   | "ready"
   /** Neither fan-out reported anything for this agent — not even a non-Modbus
    *  extension or action. The host inserts an empty result for an agent it can't

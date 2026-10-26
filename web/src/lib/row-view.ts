@@ -55,7 +55,7 @@ export const BYTE_ORDER_LABELS: Record<ByteOrder, string> = {
 
 // ─── Value ──────────────────────────────────────────────────────────────────
 
-export type ValueSource = "poll" | "read";
+type ValueSource = "poll" | "read";
 
 /** A sample that exists. `value: null` is a sample the wire couldn't carry (a
  *  sanitized non-finite float), which is not the same as having no sample.
@@ -71,11 +71,10 @@ export type ResolvedValue =
  *
  *  `supersedes` is the agent-clock `ts_ms` that `values[path]` held at the moment
  *  of the read, or null if the snapshot had no sample for the path yet. The poll
- *  takes the row back only once it reports something strictly newer than that —
- *  agent clock against agent clock. Stamping the read with `Date.now()` and
- *  comparing that to agent time was the bug: a browser running behind the agent
- *  would pin the row to its read for as long as the skew lasted. */
-export interface OverlayEntry {
+ *  takes the row back only once it reports something strictly newer than that:
+ *  agent clock against agent clock, so a browser clock behind the agent can't pin
+ *  the row to its read. */
+interface OverlayEntry {
   value: number | boolean | null;
   supersedes: number | null;
 }

@@ -11,7 +11,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   MAX_READ_COUNT,
-  WORD_COUNTS,
   decodeValue,
   encodeValue,
   formatAddress,
@@ -325,7 +324,7 @@ describe("encode → decode round-trip, every datatype × byte order", () => {
       it(`${datatype} / ${order}`, () => {
         for (const value of values) {
           const words = encodeValue(value, datatype, 1, order);
-          expect(words).toHaveLength(WORD_COUNTS[datatype]);
+          expect(words).toHaveLength(wordCount(datatype));
           expect(decodeValue(words, datatype, 1, order)).toBe(value);
         }
       });

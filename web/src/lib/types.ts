@@ -1,17 +1,9 @@
-/** Wire shapes shared by the bridge wrapper, mock host, and capability resolver.
- *
- *  Kept hand-maintained — the agent extension does not yet emit ts-rs bindings
- *  for these shapes. Until it does, the app fixtures and the agent serializer
- *  must stay in lock-step here.
- *
- *  Field naming follows the wire: snake_case. The extension's Python action
- *  signatures + return dicts use snake_case; the app's TS interfaces mirror
- *  that so the JSON round-trips without translation. */
+/** Wire shapes of the Modbus extension's actions, hand-maintained and snake_case
+ *  like the Python return dicts, so the JSON round-trips without translation. */
 
 import type { AppBridgeWorkspaceInfo } from "@zeloscloud/app-extension-sdk";
 
-/** Marketplace-canonical Modbus agent extension ID. The app's manifest
- *  `requires` block pins to this same value. */
+/** Marketplace-canonical Modbus agent extension ID. */
 export const MODBUS_EXTENSION_ID = "zeloscloud.zelos-extension-modbus";
 
 /** Every install ID the agent might surface for the Modbus extension.
@@ -105,7 +97,7 @@ export type ModbusDatatype = (typeof MODBUS_DATATYPES)[number];
 export const BYTE_ORDERS = ["big", "little", "big_swap", "little_swap"] as const;
 export type ByteOrder = (typeof BYTE_ORDERS)[number];
 
-export type ModbusTransport = "tcp" | "rtu";
+type ModbusTransport = "tcp" | "rtu";
 
 /** Workspace mode as reported by the host bridge — taken straight from the SDK
  *  rather than restated here, because it is the SDK's bridge shape and not a

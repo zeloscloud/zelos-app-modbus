@@ -12,9 +12,6 @@
  *    them, so they carry their OWN metadata (address, table, datatype, word
  *    order) and their values are decoded client-side by `lib/codec`.
  *
- *  Rows persisted before raw rows existed have no `kind` and load as `named`, so
- *  an existing table survives the upgrade untouched.
- *
  *  `address` is stored as the STRING the user typed (`"100"` or `"0x64"`) and
  *  parsed at request time, so the field round-trips through an edit without
  *  rewriting the user's preferred notation.
@@ -46,9 +43,8 @@ interface RowIdentity {
   id: string;
   agent: string;
   interface: string;
-  /** The write editor's text, kept as typed. Persisted so a row can act as a
-   *  one-click preset: several rows on the same register, each holding the value
-   *  it writes. Absent on rows saved before presets existed. */
+  /** The write editor's text, kept as typed, so a row can act as a one-click
+   *  preset: several rows on the same register, each holding the value it writes. */
   draft?: string;
 }
 
@@ -171,9 +167,8 @@ export function saveRows(rows: readonly WatchRow[]): void {
   }
 }
 
-/** One stored entry → a row, or null if it isn't usable. A row without a `kind`
- *  predates raw rows and is therefore named; a raw row falls back to the
- *  defaults for any field that no longer parses. */
+/** One stored entry → a row, or null if it isn't usable. A raw row falls back to
+ *  the defaults for any field that doesn't parse. */
 function reviveRow(entry: unknown): WatchRow | null {
   if (entry === null || typeof entry !== "object") return null;
   const r = entry as Record<string, unknown>;
@@ -202,7 +197,7 @@ function reviveRow(entry: unknown): WatchRow | null {
     );
   }
 
-  if (typeof r.path !== "string" || r.path.length === 0) return null;
+  if (r.kind !== "named" || typeof r.path !== "string" || r.path.length === 0) return null;
   return { ...identity, kind: "named", path: r.path };
 }
 

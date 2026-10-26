@@ -1,10 +1,5 @@
-/** Clipboard write with execCommand fallback for sandboxed iframes.
- *
- *  The Electron `zelos-app://` iframe's sandbox sometimes blocks
- *  `navigator.clipboard.writeText` (Permissions Policy isn't part of
- *  `<iframe sandbox>` so it can't be opted in from the inner document).
- *  The legacy `document.execCommand("copy")` path works as long as we have
- *  a focusable element with a selection — a hidden textarea handles that. */
+/** Clipboard write that falls back to `execCommand("copy")` on a hidden textarea,
+ *  because the `zelos-app://` iframe can block `navigator.clipboard.writeText`. */
 
 export async function copyToClipboard(text: string): Promise<boolean> {
   try {

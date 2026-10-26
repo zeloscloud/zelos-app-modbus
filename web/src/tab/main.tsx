@@ -5,8 +5,8 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { Toaster } from "sonner";
 import { App } from "./App";
-import "./index.css";
-import { installModbusMockHost, type MockScenario } from "./mocks/modbus-mock";
+import "../index.css";
+import { installModbusMockHost, type MockScenario } from "../mocks/modbus-mock";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -14,12 +14,9 @@ const queryClient = new QueryClient({
   },
 });
 
-/** Installs the mock host scenario whenever the bridge enters standalone mode.
- *  Embedded mode is a no-op: the real desktop host owns invoke dispatch. */
 function MockHostBootstrap({ scenario }: { scenario: MockScenario }) {
   const { status, mode, bridge } = useZelosBridge();
-  // Deliberately not the whole bridge object: it is rebuilt on every context
-  // update, and reinstalling the mock host would reset the simulated device.
+  // Not the whole context: it changes on every update, and reinstalling resets the device.
   React.useEffect(() => {
     if (status !== "ready" || mode !== "standalone") return;
     if (!(bridge instanceof MockBridge)) return;
@@ -28,17 +25,12 @@ function MockHostBootstrap({ scenario }: { scenario: MockScenario }) {
   return null;
 }
 
-/** Toasts follow the host's resolved theme rather than hardcoding dark — the
- *  desktop app's theme toggle has to move the toasts too. `null` theme (bridge
- *  still connecting) defers to the OS via sonner's "system". */
 function HostThemedToaster() {
   const theme = useTheme();
   const resolved = theme === null ? "system" : theme.resolvedDark ? "dark" : "light";
   return <Toaster position="bottom-right" theme={resolved} richColors closeButton />;
 }
 
-/** Override via `?mock=extension-stopped` (etc.) in standalone dev to exercise
- *  any capability state without editing source. */
 function readScenarioFromQuery(): MockScenario {
   if (typeof window === "undefined") return "ready";
   const param = new URLSearchParams(window.location.search).get("mock");

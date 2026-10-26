@@ -36,7 +36,9 @@ export function useAction<K extends string>(
   // `run` stay identity-stable, which is what memoized rows need. `inFlight`
   // is a ref too, because two calls in one tick would both see the same state.
   const latest = React.useRef({ target, debugContext });
-  latest.current = { target, debugContext };
+  React.useLayoutEffect(() => {
+    latest.current = { target, debugContext };
+  });
   const inFlight = React.useRef(false);
 
   const run = React.useCallback(
