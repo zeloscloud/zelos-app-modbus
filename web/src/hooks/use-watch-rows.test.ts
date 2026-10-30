@@ -5,6 +5,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { deviceEntry } from "@/components/__tests__/register-fixtures";
 import { createRow, defaultRawRow, loadRows, saveRows, type WatchRow } from "@/lib/watch-store";
 
 import { useWatchRows } from "./use-watch-rows";
@@ -12,7 +13,7 @@ import { useWatchRows } from "./use-watch-rows";
 const AGENT = "localhost:2300";
 
 function named(path: string) {
-  return { kind: "named", agent: AGENT, interface: "meter", path } as const;
+  return { kind: "named", agent: AGENT, device: "meter", path } as const;
 }
 
 /** Paths for named rows, `raw` for anything else — enough to assert ordering. */
@@ -37,7 +38,7 @@ describe("useWatchRows", () => {
       result.current.addRow(named("power/total"));
     });
     act(() => {
-      result.current.addRow(defaultRawRow(AGENT, "meter"));
+      result.current.addRow(defaultRawRow(AGENT, deviceEntry()));
     });
     act(() => {
       result.current.addRow(named("status/relay1"));
@@ -83,7 +84,7 @@ describe("useWatchRows", () => {
     const { result } = renderHook(() => useWatchRows());
     let id = "";
     act(() => {
-      id = result.current.addRow(defaultRawRow(AGENT, "meter")).id;
+      id = result.current.addRow(defaultRawRow(AGENT, deviceEntry())).id;
     });
     act(() => {
       result.current.updateRow(id, { address: "0x64", datatype: "float32" });
@@ -99,13 +100,13 @@ describe("useWatchRows", () => {
     const { result } = renderHook(() => useWatchRows());
     let id = "";
     act(() => {
-      id = result.current.addRow(defaultRawRow(AGENT, "meter")).id;
-      result.current.addRow(defaultRawRow(AGENT, "meter"));
+      id = result.current.addRow(defaultRawRow(AGENT, deviceEntry())).id;
+      result.current.addRow(defaultRawRow(AGENT, deviceEntry()));
     });
     act(() => {
       result.current.updateRow(id, { address: "50" });
     });
-    expect(loadRows().map((r) => (r.kind === "raw" ? r.address : null))).toEqual(["50", "0"]);
+    expect(loadRows().map((r) => (r.kind === "raw" ? r.address : null))).toEqual(["50", "1"]);
   });
 
   it("removes only the requested row, and persists that too", () => {

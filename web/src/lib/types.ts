@@ -16,15 +16,12 @@ export const MODBUS_EXTENSION_ID = "zeloscloud.zelos-extension-modbus";
 export const MODBUS_EXTENSION_INSTALL_IDS: ReadonlySet<string> = new Set([
   MODBUS_EXTENSION_ID,
   "local.modbus",
-  "local.zelos-extension-modbus",
 ]);
 
-/** Bare method names exposed by the Modbus extension. The on-wire surface is a
- *  single global namespace: every method is `modbus/<method>` and takes an
- *  `interface` parameter (the registry key) to select which client to operate
- *  on. Use {@link modbusActionPath} to build a full path. */
+/** Action names the Modbus extension registers under `Modbus/`. Every one but
+ *  `list_devices` takes a `device` parameter (`<connection>/<device>`). */
 export const MODBUS_METHODS = {
-  listInterfaces: "list_interfaces",
+  listDevices: "list_devices",
   getSnapshot: "get_snapshot",
   listRegisters: "list_registers",
   readNamedRegister: "read_named_register",
@@ -33,38 +30,16 @@ export const MODBUS_METHODS = {
   writeSingleRegister: "write_single_register",
   writeRegisters: "write_registers",
   writeCoil: "write_coil",
-  /** Legacy status action. Superseded by `get_snapshot`, which returns the same
-   *  counters plus cached values in one round-trip — the app never calls it. */
-  getStatus: "get_status",
 } as const;
 
 export type ModbusMethodName = (typeof MODBUS_METHODS)[keyof typeof MODBUS_METHODS];
 
-/** Action paths every running Modbus extension must surface before the app
- *  considers it ready. `list_interfaces`, `get_snapshot` and the enriched
- *  `list_registers` land in extension 0.1.5; the rest have existed since
- *  0.1.x. A missing entry means "extension too old", not "misconfigured". */
-export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = [
-  MODBUS_METHODS.listInterfaces,
-  MODBUS_METHODS.getSnapshot,
-  MODBUS_METHODS.listRegisters,
-  MODBUS_METHODS.readNamedRegister,
-  MODBUS_METHODS.writeNamedRegister,
-  MODBUS_METHODS.readRegister,
-  MODBUS_METHODS.writeSingleRegister,
-  MODBUS_METHODS.writeRegisters,
-  MODBUS_METHODS.writeCoil,
-];
+/** Every action this app drives; a running extension missing one is too old. */
+export const REQUIRED_MODBUS_METHODS: readonly ModbusMethodName[] = Object.values(MODBUS_METHODS);
 
-/** First extension release carrying the required action set. Used in
- *  remediation copy only — the action-path check above is the real guard. */
-export const MIN_MODBUS_EXTENSION_VERSION = "0.1.5";
+export const MODBUS_ACTION_PREFIX = "Modbus/";
 
-/** Namespace every Modbus action path sits under. */
-export const MODBUS_ACTION_PREFIX = "modbus/";
-
-/** Build the full action path for a given method. */
-export function modbusActionPath(method: ModbusMethodName | string): string {
+export function modbusActionPath(method: ModbusMethodName): string {
   return `${MODBUS_ACTION_PREFIX}${method}`;
 }
 
@@ -106,99 +81,99 @@ type ModbusTransport = "tcp" | "rtu";
  *  simply not "LIVE" and disables actions. */
 export type WorkspaceModeKind = AppBridgeWorkspaceInfo["modeKind"];
 
-// ─── modbus/list_interfaces ─────────────────────────────────────────────────
+// ─── Modbus/list_devices ────────────────────────────────────────────────────
 
-export interface ModbusInterfaceEntry {
-  /** Registry key — exactly the value the `interface` action param accepts. */
+export interface ModbusDeviceEntry {
+  /** `<connection>/<device>`: the value the `device` action parameter takes. */
   name: string;
   transport: ModbusTransport;
+  /** `host:port` (TCP) or `port@baud` (RTU). */
+  endpoint: string;
   connected: boolean;
-  /** Human-readable endpoint: `host:port` (TCP) or `port@baud` (RTU). */
-  connection: string;
   unit_id: number;
-  /** Where the interface came from (config file / discovery). */
-  source: string;
-  /** Register-map name, or null when the interface runs raw-only. */
+  /** Numbering of every address the actions take and return: 1 (default) or 0. */
+  address_base: number;
+  /** Register-map name, or null without a map (raw only, or auto-scanned). */
   map_name: string | null;
+  /** Registers in the map plus any auto-scan has found. */
   register_count: number;
-  /** Default poll cadence in SECONDS. */
-  poll_interval: number;
+  /** Default poll rate in seconds; 0 = not polled. */
+  rate: number;
   write_mode: string;
+  /** Whether the raw (address) write actions are allowed. */
+  raw_writes: boolean;
 }
 
-export interface ListInterfacesResult {
-  interfaces: ModbusInterfaceEntry[];
+export interface ListDevicesResult {
+  devices: ModbusDeviceEntry[];
   count: number;
   success: boolean;
 }
 
-// ─── modbus/get_snapshot ────────────────────────────────────────────────────
+// ─── Modbus/get_snapshot ────────────────────────────────────────────────────
+
+/** A decoded value. `null` is a value JSON can't carry (a NaN or ±Inf off the
+ *  wire), which the extension sanitizes at the action boundary. */
+export type WireValue = number | boolean | string | null;
 
 export interface SnapshotValue {
-  /** `null` when the polled value isn't representable in JSON: the extension
-   *  sanitizes non-finite floats (a NaN or ±Inf straight off the wire — e.g. a
-   *  float32 of all ones from an unpopulated sensor) to null at the action
-   *  boundary rather than failing the whole snapshot. The poll succeeded; only
-   *  the number is unusable. */
-  value: number | boolean | null;
+  value: WireValue;
   /** Unix epoch ms, agent clock, of the poll that produced this value. */
   ts_ms: number;
 }
 
-/** Last-polled cache — no device I/O. Registers that were never polled (or
- *  have `poll_interval: 0`) are absent from `values` entirely. */
+/** Last-polled cache, no device I/O. Registers never polled or read are absent. */
 export interface ModbusSnapshot {
-  interface: string;
+  device: string;
   connected: boolean;
-  transport: ModbusTransport;
-  connection: string;
-  unit_id: number;
   poll_count: number;
-  error_count: number;
+  successful_reads: number;
+  failed_reads: number;
   captured_at_unix_ms: number;
   /** Keyed by register path (`"<event>/<name>"`). */
   values: Record<string, SnapshotValue>;
   success: boolean;
 }
 
-// ─── modbus/list_registers ──────────────────────────────────────────────────
+// ─── Modbus/list_registers ──────────────────────────────────────────────────
+
+/** A map register's datatype: a raw-row datatype, or a string spanning several words. */
+type RegisterDatatype = ModbusDatatype | "string";
 
 export interface RegisterEntry {
   name: string;
   event: string;
-  /** `"<event>/<name>"` — the key used by snapshots and named read/write. */
+  /** `"<event>/<name>"`: the key used by snapshots and named read/write. */
   path: string;
+  /** In the device's address base. */
   address: number;
   type: RegisterTableType;
-  datatype: ModbusDatatype;
+  datatype: RegisterDatatype;
   unit: string;
   scale: number;
   description: string;
   writable: boolean;
   byte_order: ByteOrder;
-  /** Seconds. `null` inherits the interface default; `0` disables polling
-   *  (the register will never appear in a snapshot). */
-  poll_interval: number | null;
+  /** Effective poll rate in seconds; 0 = not polled (never in a snapshot). */
+  rate: number;
 }
 
 export interface ListRegistersResult {
   registers: RegisterEntry[];
   count: number;
   map_name: string | null;
+  success: boolean;
 }
 
 // ─── Named register read/write ──────────────────────────────────────────────
 
-/** Decoded + scaled extension-side. `value` is null when the read failed. */
+/** Decoded and scaled extension-side. */
 export interface NamedRegisterResult {
   name: string;
   address: number;
   type: RegisterTableType;
-  datatype: ModbusDatatype;
-  /** `null` alongside `success: true` is a successful read of a value JSON can't
-   *  carry — a sanitized non-finite float, exactly as in {@link SnapshotValue}.
-   *  It is not a failure, and not the same thing as "never read". */
-  value: number | boolean | null;
+  datatype: RegisterDatatype;
+  value: WireValue;
   unit: string;
   success: boolean;
 }
@@ -210,7 +185,7 @@ export interface RawReadResult {
   address: number;
   type: RegisterTableType;
   count: number;
-  values: number[] | boolean[] | null;
+  values: number[] | boolean[];
   success: boolean;
 }
 

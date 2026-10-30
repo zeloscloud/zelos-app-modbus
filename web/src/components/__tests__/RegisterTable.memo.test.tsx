@@ -9,7 +9,7 @@ import * as React from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import { RegisterTable } from "../RegisterTable";
-import { bridgeStub, namedRow, register, snapshot } from "./register-fixtures";
+import { bridgeStub, deviceEntry, namedRow, register, snapshot } from "./register-fixtures";
 import type { ModbusSnapshot } from "@/lib/types";
 import { patchRow, type WatchRow } from "@/lib/watch-store";
 
@@ -33,6 +33,7 @@ const CATALOG = [
 ];
 
 const BRIDGE = bridgeStub();
+const DEVICE = deviceEntry();
 const INITIAL_ROWS: readonly WatchRow[] = [namedRow("power/total"), namedRow("power/factor")];
 const NOOP = () => {};
 
@@ -49,8 +50,7 @@ function Harness({ snap }: { snap: ModbusSnapshot }) {
     <RegisterTable
       bridge={BRIDGE}
       agentAddress="localhost:2300"
-      interfaceName="meter"
-      interfacePollInterval={1}
+      device={DEVICE}
       registers={CATALOG}
       rows={rows}
       catalogReady

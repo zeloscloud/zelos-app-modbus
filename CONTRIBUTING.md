@@ -30,7 +30,7 @@ until its first build.
 | Mock host                | `web/src/mocks/modbus-mock.ts`                                   |
 
 All server state goes through TanStack Query. The snapshot key is
-`["modbus-snapshot", agent, interface]`, so every subscriber on one interface shares a single poll.
+`["modbus-snapshot", agent, device]`, so every subscriber on one device shares a single poll.
 
 ## Commands
 
@@ -62,8 +62,8 @@ change:
   use `just dev` to work on it in the browser against the mock host of the SDK.
 - `extension.toml`: run `zelos extensions install-local .` again.
 
-The tab needs the Modbus agent extension running on an agent, with at least one interface
-configured.
+The tab needs the Modbus agent extension 0.1.6 or later running on an agent, with at least one
+device configured.
 
 ## Mock host
 
@@ -75,12 +75,13 @@ Pick a capability state with `?mock=<scenario>`:
 
 | Scenario             | What it simulates                                            |
 | -------------------- | ------------------------------------------------------------ |
-| `ready` (default)    | One agent, a mapped TCP interface + a raw-only RTU interface |
-| `extension-missing`  | Agent has no Modbus extension installed                      |
-| `extension-stopped`  | Installed but not running (Start button live)                |
-| `extension-outdated` | 0.1.4-era action set, so the required-actions check trips    |
-| `no-interfaces`      | Running, healthy actions, zero interfaces configured         |
-| `multi-agent`        | One ready agent + one missing the extension                  |
+| `ready` (default)    | One agent: a mapped TCP device, and a raw-only RTU device with raw writes off |
+| `extension-missing`  | Agent has no Modbus extension installed                                        |
+| `extension-stopped`  | Installed but not running (Start button live)                                  |
+| `extension-outdated` | Running, but lacks an action this tab drives                                   |
+| `extension-0.1.5`    | Running 0.1.5, which serves its actions under `modbus/`                        |
+| `no-devices`         | Running, healthy actions, zero devices configured                              |
+| `multi-agent`        | One ready agent + one missing the extension                                    |
 
 ## Testing
 

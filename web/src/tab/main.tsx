@@ -38,7 +38,8 @@ function readScenarioFromQuery(): MockScenario {
     case "extension-missing":
     case "extension-stopped":
     case "extension-outdated":
-    case "no-interfaces":
+    case "extension-0.1.5":
+    case "no-devices":
     case "multi-agent":
       return param;
     default:

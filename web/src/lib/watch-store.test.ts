@@ -20,6 +20,8 @@ import {
   type RawWatchRow,
   type WatchRow,
 } from "./watch-store";
+import { deviceEntry } from "@/components/__tests__/register-fixtures";
+
 import type { RawReadResult } from "./types";
 
 const STORAGE_KEY = "zelos-app-modbus.watch-rows.v1";
@@ -32,7 +34,7 @@ function named(overrides: Partial<Omit<NamedWatchRow, "id" | "kind">> = {}): Nam
   const row = createRow({
     kind: "named",
     agent: "localhost:2300",
-    interface: "meter",
+    device: "meter",
     path: "power/total",
     ...overrides,
   });
@@ -41,7 +43,7 @@ function named(overrides: Partial<Omit<NamedWatchRow, "id" | "kind">> = {}): Nam
 }
 
 function raw(overrides: Partial<Omit<RawWatchRow, "id" | "kind">> = {}): RawWatchRow {
-  const row = createRow({ ...defaultRawRow("localhost:2300", "meter"), ...overrides });
+  const row = createRow({ ...defaultRawRow("localhost:2300", deviceEntry()), ...overrides });
   if (row.kind !== "raw") throw new Error("expected a raw row");
   return row;
 }
@@ -53,7 +55,7 @@ describe("createRow / defaultRawRow", () => {
     const row = named({ path: "status/temperature" });
     expect(row.id).toBeTruthy();
     expect(row.agent).toBe("localhost:2300");
-    expect(row.interface).toBe("meter");
+    expect(row.device).toBe("meter");
     expect(row.path).toBe("status/temperature");
   });
 
@@ -62,15 +64,15 @@ describe("createRow / defaultRawRow", () => {
   });
 
   it("stores identity only on a named row — no register metadata to go stale", () => {
-    expect(Object.keys(named()).sort()).toEqual(["agent", "id", "interface", "kind", "path"]);
+    expect(Object.keys(named()).sort()).toEqual(["agent", "device", "id", "kind", "path"]);
   });
 
-  it("starts a raw row on holding / uint16 / big at address 0", () => {
-    expect(defaultRawRow("a:1", "iface")).toEqual({
+  it("starts a raw row on holding / uint16 / big at the device's first address", () => {
+    expect(defaultRawRow("a:1", deviceEntry({ name: "rs485/probe" }))).toEqual({
       kind: "raw",
       agent: "a:1",
-      interface: "iface",
-      address: "0",
+      device: "rs485/probe",
+      address: "1",
       table: "holding",
       datatype: "uint16",
       byte_order: "big",
@@ -102,17 +104,15 @@ describe("loadRows / saveRows", () => {
     expect(loadRows()).toEqual([]);
   });
 
-  it("keeps rows for every (agent, interface) — filtering happens in the UI", () => {
-    saveRows([named({ agent: "a:1", interface: "meter" }), raw({ interface: "probe" })]);
+  it("keeps rows for every (agent, device) — filtering happens in the UI", () => {
+    saveRows([named({ agent: "a:1", device: "meter" }), raw({ device: "probe" })]);
     expect(loadRows()).toHaveLength(2);
   });
 
   it("drops a stored row with no kind", () => {
     window.localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([
-        { id: "a", agent: "localhost:2300", interface: "meter", path: "power/total" },
-      ]),
+      JSON.stringify([{ id: "a", agent: "localhost:2300", device: "meter", path: "power/total" }]),
     );
     expect(loadRows()).toEqual([]);
   });
@@ -124,7 +124,7 @@ describe("loadRows / saveRows", () => {
         {
           id: "a",
           agent: "localhost:2300",
-          interface: "meter",
+          device: "meter",
           kind: "raw",
           address: "10",
           table: "nonsense",
@@ -149,7 +149,7 @@ describe("loadRows / saveRows", () => {
         {
           id: "a",
           agent: "localhost:2300",
-          interface: "meter",
+          device: "meter",
           kind: "raw",
           address: "3",
           table: "coil",
@@ -167,14 +167,14 @@ describe("loadRows / saveRows", () => {
       STORAGE_KEY,
       JSON.stringify([
         good,
-        { agent: "missing-id", interface: "meter", path: "power/total" },
+        { agent: "missing-id", device: "meter", path: "power/total" },
         null,
         "string-not-object",
-        { id: "x", agent: "a", interface: "i" },
-        { id: "y", agent: "a", interface: "i", path: "" },
-        { id: "z", agent: "a", interface: "i", path: 42 },
-        { id: "w", agent: "a", interface: "i", kind: "raw" },
-        { id: "v", agent: "a", interface: "i", kind: "raw", address: "" },
+        { id: "x", agent: "a", device: "i" },
+        { id: "y", agent: "a", device: "i", path: "" },
+        { id: "z", agent: "a", device: "i", path: 42 },
+        { id: "w", agent: "a", device: "i", kind: "raw" },
+        { id: "v", agent: "a", device: "i", kind: "raw", address: "" },
       ]),
     );
     expect(loadRows()).toEqual([good]);
@@ -184,9 +184,9 @@ describe("loadRows / saveRows", () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify([
-        { id: "dup", agent: "a", interface: "i", kind: "named", path: "power/total" },
-        { id: "dup", agent: "a", interface: "i", kind: "named", path: "power/factor" },
-        { id: "other", agent: "a", interface: "i", kind: "named", path: "status/temperature" },
+        { id: "dup", agent: "a", device: "i", kind: "named", path: "power/total" },
+        { id: "dup", agent: "a", device: "i", kind: "named", path: "power/factor" },
+        { id: "other", agent: "a", device: "i", kind: "named", path: "status/temperature" },
       ]),
     );
     const rows = loadRows();
@@ -282,39 +282,59 @@ describe("rawRowLabel", () => {
 
 describe("planRawRead", () => {
   it("parses decimal and hex addresses", () => {
-    expect(planRawRead(raw({ address: "100" }))).toEqual({
+    expect(planRawRead(raw({ address: "100" }), 0)).toEqual({
       ok: true,
       plan: { address: 100, table: "holding", count: 1 },
     });
-    const hex = planRawRead(raw({ address: "0x64" }));
+    const hex = planRawRead(raw({ address: "0x64" }), 0);
     expect(hex.ok && hex.plan.address).toBe(100);
   });
 
+  it("reads hex as the 0-based wire address, and decimal in the device's numbering", () => {
+    const hex = planRawRead(raw({ address: "0x64" }), 1);
+    expect(hex.ok && hex.plan.address).toBe(101);
+    const dec = planRawRead(raw({ address: "100" }), 1);
+    expect(dec.ok && dec.plan.address).toBe(100);
+    const coil = planRawWrite(raw({ table: "coil", datatype: "bool", address: "0x0" }), true, 1);
+    expect(coil.ok && coil.plan.address).toBe(1);
+  });
+
   it("asks for one address per word of the datatype", () => {
-    const f32 = planRawRead(raw({ datatype: "float32" }));
+    const f32 = planRawRead(raw({ datatype: "float32" }), 0);
     expect(f32.ok && f32.plan.count).toBe(2);
-    const i64 = planRawRead(raw({ datatype: "int64" }));
+    const i64 = planRawRead(raw({ datatype: "int64" }), 0);
     expect(i64.ok && i64.plan.count).toBe(4);
   });
 
   it("asks for a single address on a bit table", () => {
-    const plan = planRawRead(raw({ table: "coil", datatype: "bool" }));
+    const plan = planRawRead(raw({ table: "coil", datatype: "bool" }), 0);
     expect(plan.ok && plan.plan.count).toBe(1);
   });
 
   it("rejects an unparsable address", () => {
-    expect(planRawRead(raw({ address: "beef" }))).toEqual({
+    expect(planRawRead(raw({ address: "beef" }), 0)).toEqual({
       ok: false,
-      error: 'Address "beef" is not a value in 0…65535 (dec or 0x)',
+      error: 'Address "beef" is neither a decimal 0…65536 nor a 0x wire address 0x0000…0xffff',
     });
   });
 
   it("rejects a read that runs past the address space", () => {
-    const over = planRawRead(raw({ address: "65535", datatype: "uint32" }));
-    expect(over.ok).toBe(false);
-    if (!over.ok) expect(over.error).toMatch(/past address 65535/);
+    const over = planRawRead(raw({ address: "65535", datatype: "uint32" }), 0);
+    expect(over).toEqual({
+      ok: false,
+      error: "Address 65535 (count 2) is outside 0-65535 (address base 0)",
+    });
     // Exactly reaching the last address is fine.
-    expect(planRawRead(raw({ address: "65534", datatype: "uint32" })).ok).toBe(true);
+    expect(planRawRead(raw({ address: "65534", datatype: "uint32" }), 0).ok).toBe(true);
+  });
+
+  it("checks the address against the device's base, as the extension does", () => {
+    expect(planRawRead(raw({ address: "0" }), 1)).toEqual({
+      ok: false,
+      error: "Address 0 (count 1) is outside 1-65536 (address base 1)",
+    });
+    expect(planRawRead(raw({ address: "65536" }), 1).ok).toBe(true);
+    expect(planRawRead(raw({ address: "65535", datatype: "uint32" }), 1).ok).toBe(true);
   });
 });
 
@@ -322,7 +342,7 @@ describe("planRawRead", () => {
 
 describe("planRawWrite", () => {
   it("picks FC6 for a single word, so the call site needs no function-code logic", () => {
-    const plan = planRawWrite(raw({ address: "100", datatype: "uint16" }), 1234);
+    const plan = planRawWrite(raw({ address: "100", datatype: "uint16" }), 1234, 0);
     expect(plan).toEqual({ ok: true, plan: { kind: "single", address: 100, word: 1234 } });
   });
 
@@ -330,36 +350,37 @@ describe("planRawWrite", () => {
     const plan = planRawWrite(
       raw({ address: "110", datatype: "float32", byte_order: "big_swap" }),
       3.14,
+      0,
     );
     expect(plan.ok && plan.plan.kind === "multi" && plan.plan.words).toEqual([0xf5c3, 0x4048]);
   });
 
   it("writes raw values unscaled", () => {
-    const plan = planRawWrite(raw({ datatype: "uint16" }), 100);
+    const plan = planRawWrite(raw({ datatype: "uint16" }), 100, 0);
     expect(plan.ok && plan.plan.kind === "single" && plan.plan.word).toBe(100);
   });
 
   it("surfaces the codec's range error rather than wrapping the value", () => {
-    const plan = planRawWrite(raw({ datatype: "uint16" }), 70000);
+    const plan = planRawWrite(raw({ datatype: "uint16" }), 70000, 0);
     expect(plan.ok).toBe(false);
     if (!plan.ok) expect(plan.error).toMatch(/out of range/);
   });
 
   it("rejects a value that isn't a finite number", () => {
-    expect(planRawWrite(raw(), Number.NaN).ok).toBe(false);
-    expect(planRawWrite(raw(), Number.POSITIVE_INFINITY).ok).toBe(false);
+    expect(planRawWrite(raw(), Number.NaN, 0).ok).toBe(false);
+    expect(planRawWrite(raw(), Number.POSITIVE_INFINITY, 0).ok).toBe(false);
   });
 
   it("plans a coil write from a boolean", () => {
-    const on = planRawWrite(raw({ table: "coil", datatype: "bool", address: "3" }), true);
+    const on = planRawWrite(raw({ table: "coil", datatype: "bool", address: "3" }), true, 0);
     expect(on).toEqual({ ok: true, plan: { kind: "coil", address: 3, on: true } });
-    const off = planRawWrite(raw({ table: "coil", datatype: "bool", address: "3" }), false);
+    const off = planRawWrite(raw({ table: "coil", datatype: "bool", address: "3" }), false, 0);
     expect(off.ok && off.plan.kind === "coil" && off.plan.on).toBe(false);
   });
 
   it("refuses the two tables Modbus can't write, in the words the cell uses", () => {
     for (const table of ["input", "discrete_input"] as const) {
-      const plan = planRawWrite(raw({ table }), 1);
+      const plan = planRawWrite(raw({ table }), 1, 0);
       expect(plan.ok).toBe(false);
       if (!plan.ok) expect(plan.error).toBe(readOnlyReason(table));
     }
@@ -367,18 +388,24 @@ describe("planRawWrite", () => {
   });
 
   it("rejects an unparsable address before it encodes anything", () => {
-    expect(planRawWrite(raw({ address: "" }), 1).ok).toBe(false);
+    expect(planRawWrite(raw({ address: "" }), 1, 0).ok).toBe(false);
   });
 
   it("rejects a multi-word write that runs past the address space", () => {
-    expect(planRawWrite(raw({ address: "65535", datatype: "uint32" }), 1).ok).toBe(false);
+    expect(planRawWrite(raw({ address: "65535", datatype: "uint32" }), 1, 0).ok).toBe(false);
+  });
+
+  it("checks a coil's address against the device's base", () => {
+    const coil = raw({ table: "coil", datatype: "bool", address: "0" });
+    expect(planRawWrite(coil, true, 1).ok).toBe(false);
+    expect(planRawWrite(coil, true, 0).ok).toBe(true);
   });
 });
 
 // ─── Interpreting the response ─────────────────────────────────────────────
 
 describe("interpretRawRead", () => {
-  function response(values: number[] | boolean[] | null): RawReadResult {
+  function response(values: number[] | boolean[]): RawReadResult {
     return { address: 0, type: "holding", count: 1, values, success: true };
   }
 
@@ -413,13 +440,10 @@ describe("interpretRawRead", () => {
   });
 
   it("refuses a response with no values at all", () => {
-    expect(() => interpretRawRead(raw(), response(null))).toThrow("expected 1 word(s), got 0");
+    expect(() => interpretRawRead(raw(), response([]))).toThrow("expected 1 word(s), got 0");
     expect(() => interpretRawRead(raw({ table: "coil", datatype: "bool" }), response([]))).toThrow(
       "expected 1 bit, got 0",
     );
-    expect(() =>
-      interpretRawRead(raw({ table: "coil", datatype: "bool" }), response(null)),
-    ).toThrow("expected 1 bit, got 0");
   });
 
   it("refuses a response with more words than were asked for", () => {
@@ -474,7 +498,7 @@ describe("NewWatchRow", () => {
     const input: NewWatchRow = {
       kind: "named",
       agent: "a:1",
-      interface: "meter",
+      device: "meter",
       path: "power/total",
     };
     const row: WatchRow = createRow(input);
@@ -482,7 +506,7 @@ describe("NewWatchRow", () => {
   });
 
   it("keeps the discriminant, so a raw input can only make a raw row", () => {
-    const row: WatchRow = createRow(defaultRawRow("a:1", "meter"));
+    const row: WatchRow = createRow(defaultRawRow("a:1", deviceEntry()));
     expect(row.kind).toBe("raw");
   });
 });

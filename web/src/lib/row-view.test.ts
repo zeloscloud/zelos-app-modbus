@@ -34,7 +34,7 @@ function reg(overrides: Partial<RegisterEntry> = {}): RegisterEntry {
     description: "",
     writable: true,
     byte_order: "big",
-    poll_interval: null,
+    rate: 1,
     ...overrides,
   };
 }
@@ -44,7 +44,7 @@ function raw(overrides: Partial<Omit<RawWatchRow, "id" | "kind">> = {}): RawWatc
     id: "r1",
     kind: "raw",
     agent: "localhost:2300",
-    interface: "meter",
+    device: "meter",
     address: "0",
     table: "holding",
     datatype: "uint16",
@@ -55,13 +55,11 @@ function raw(overrides: Partial<Omit<RawWatchRow, "id" | "kind">> = {}): RawWatc
 
 function snapshot(values: ModbusSnapshot["values"]): ModbusSnapshot {
   return {
-    interface: "meter",
+    device: "meter",
     connected: true,
-    transport: "tcp",
-    connection: "127.0.0.1:502",
-    unit_id: 1,
     poll_count: 1,
-    error_count: 0,
+    successful_reads: 1,
+    failed_reads: 0,
     captured_at_unix_ms: CAPTURED,
     values,
     success: true,
@@ -222,7 +220,7 @@ describe("namedWriteModel", () => {
 
 describe("rawWriteModel", () => {
   it("offers an unscaled, unitless numeric editor on a holding address", () => {
-    expect(rawWriteModel(raw({ datatype: "uint32" }))).toEqual({
+    expect(rawWriteModel(raw({ datatype: "uint32" }), true)).toEqual({
       kind: "numeric",
       datatype: "uint32",
       scale: 1,
@@ -233,15 +231,25 @@ describe("rawWriteModel", () => {
   });
 
   it("offers a switch on a coil", () => {
-    expect(rawWriteModel(raw({ table: "coil", datatype: "bool" })).kind).toBe("switch");
+    expect(rawWriteModel(raw({ table: "coil", datatype: "bool" }), true).kind).toBe("switch");
   });
 
   it("refuses the two tables Modbus can't write", () => {
-    expect(rawWriteModel(raw({ table: "input" }))).toEqual({
+    expect(rawWriteModel(raw({ table: "input" }), true)).toEqual({
       kind: "readonly",
       why: "input registers are read-only",
     });
-    expect(rawWriteModel(raw({ table: "discrete_input", datatype: "bool" })).kind).toBe("readonly");
+    expect(rawWriteModel(raw({ table: "discrete_input", datatype: "bool" }), true).kind).toBe(
+      "readonly",
+    );
+  });
+
+  it("refuses every write while the extension keeps raw writes off, saying where to turn them on", () => {
+    expect(rawWriteModel(raw({ datatype: "uint16" }), false)).toEqual({
+      kind: "readonly",
+      why: "raw writes are off: turn on Allow Raw Writes in the Modbus extension's settings",
+    });
+    expect(rawWriteModel(raw({ table: "coil", datatype: "bool" }), false).kind).toBe("readonly");
   });
 });
 
@@ -311,21 +319,18 @@ describe("resolveValue", () => {
 });
 
 describe("stalenessThresholdMs", () => {
-  it("uses ~3× the register's own interval", () => {
-    expect(stalenessThresholdMs(2, 10)).toBe(6_000);
-  });
-
-  it("falls back to the interface interval when the register inherits", () => {
-    expect(stalenessThresholdMs(null, 4)).toBe(12_000);
+  it("uses ~3× the register's poll rate", () => {
+    expect(stalenessThresholdMs(2)).toBe(6_000);
   });
 
   it("never drops below 1.5 s", () => {
-    expect(stalenessThresholdMs(0.1, 10)).toBe(1_500);
+    expect(stalenessThresholdMs(0.1)).toBe(1_500);
   });
 
-  it("falls back to a fixed cutoff when polling is disabled or nonsense", () => {
-    expect(stalenessThresholdMs(0, 0)).toBe(5_000);
-    expect(stalenessThresholdMs(Number.NaN, Number.NaN)).toBe(5_000);
+  it("falls back to a fixed cutoff when the rate is unknown, off or nonsense", () => {
+    expect(stalenessThresholdMs(null)).toBe(5_000);
+    expect(stalenessThresholdMs(0)).toBe(5_000);
+    expect(stalenessThresholdMs(Number.NaN)).toBe(5_000);
   });
 });
 

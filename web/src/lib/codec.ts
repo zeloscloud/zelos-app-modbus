@@ -1,37 +1,10 @@
-/** Client-side Modbus value codec for arbitrary-address (raw) access.
+/** Client-side Modbus value codec for raw (arbitrary-address) rows, whose words
+ *  the extension returns undecoded.
  *
- *  Named registers are decoded/encoded extension-side (`read_named_register` /
- *  `write_named_register`). For raw reads and writes the extension hands us
- *  undecoded 16-bit words, so the app has to do the type handling itself.
- *
- *  This file is a 1:1 port of `zelos_extension_modbus/client.py`
- *  (`_reorder_registers`, `decode_value`, `encode_value`) so that a raw read of
- *  a mapped address agrees with the same register's named read. The quirks are
- *  ported deliberately:
- *
- *  - Word-granular reordering only. Byte order inside a word is never touched,
- *    and a single-word value is never reordered (`len(regs) <= 1` short-circuit).
- *    `big_swap`/`little_swap` only have defined permutations for 2- and 4-word
- *    values; other lengths pass through unchanged.
- *  - Scaled INTEGER results are truncated: Python does `int(raw * scale)`, so
- *    `decode_value([1005], "uint16", scale=0.1)` is `100`, not `100.5`. Float
- *    datatypes keep their fraction.
- *  - Encoding divides by the scale and truncates toward zero before packing
- *    (`int(value / scale)`), with a `scale == 0` guard that uses the value as-is.
- *
- *  Deliberate divergences from the Python source, both documented at their
- *  implementation site:
- *
- *  1. 64-bit integers are assembled/packed through `BigInt`, and an unscaled
- *     decode returns that `BigInt` exactly. Python short-circuits `scale == 1`
- *     for integers too (`_scaled_int`), so both sides are exact at scale 1; the
- *     difference is that TS additionally keeps the `bigint` all the way through
- *     the UI, so a value above 2^53 can be displayed and re-written without
- *     passing through a double. Scaled decodes agree.
- *  2. Out-of-range encodes throw instead of wrapping. Python's `uint16` branch
- *     masks with `& 0xFFFF` (70000 → 4464) and the others raise `struct.error`;
- *     refusing the write is the safer behavior for a UI and matches what the
- *     inline validators tell the user. In-range values encode identically. */
+ *  A port of `zelos_extension_modbus/client.py` (`_reorder_registers`,
+ *  `decode_value`, `encode_value`), so a raw read of a mapped address agrees with
+ *  that register's named read. Two divergences: an unscaled 64-bit integer stays
+ *  a `bigint` all the way to the UI, and an out-of-range encode names the range. */
 
 import {
   BIT_REGISTER_TYPES,
@@ -107,32 +80,20 @@ export function isBooleanRegister(table: RegisterTableType, datatype: ModbusData
   return isBitTable(table) || datatype === "bool";
 }
 
-/** Word-granular reorder, exactly as `_reorder_registers` does it.
+/** Map wire words to and from big-endian (ABCD) words; its own inverse.
  *
- *  The Python helper ignores its `for_decode` flag, so encode and decode share
- *  one permutation. Every defined permutation is an involution, which is what
- *  makes encode → decode round-trip for all four orders. */
+ *  For bytes A (most significant) to D: big = AB CD, little = DC BA, big_swap =
+ *  CD AB, little_swap = BA DC, extended the same way to 64 bits. A single word is
+ *  never reordered. */
 export function reorderWords(words: readonly number[], byteOrder: ByteOrder): number[] {
-  if (words.length <= 1) return [...words];
-  const regs = [...words];
-  switch (byteOrder) {
-    case "big":
-      // Standard Modbus: AB CD (no change).
-      return regs;
-    case "little":
-      // Full little endian: DC BA (reverse all).
-      return regs.reverse();
-    case "big_swap":
-      // Big endian with word swap: CD AB (swap pairs).
-      if (regs.length === 2) return [at(regs, 1), at(regs, 0)];
-      if (regs.length === 4) return [at(regs, 1), at(regs, 0), at(regs, 3), at(regs, 2)];
-      return regs;
-    case "little_swap":
-      // Little endian with word swap: BA DC.
-      if (regs.length === 2) return [at(regs, 1), at(regs, 0)];
-      if (regs.length === 4) return [at(regs, 3), at(regs, 2), at(regs, 1), at(regs, 0)];
-      return regs;
-  }
+  if (words.length <= 1 || byteOrder === "big") return [...words];
+  if (byteOrder === "big_swap") return [...words].reverse();
+  if (byteOrder === "little_swap") return words.map(swapBytes);
+  return [...words].reverse().map(swapBytes);
+}
+
+function swapBytes(word: number): number {
+  return ((word & 0xff) << 8) | ((word >> 8) & 0xff);
 }
 
 /** Raw (pre-scale) range for a datatype. 64-bit integers use `bigint` bounds
@@ -174,7 +135,6 @@ export function physicalRange(
   const raw = rawRange(datatype);
   const lo = Number(raw.min);
   const hi = Number(raw.max);
-  if (!Number.isFinite(scale) || scale === 0) return { min: lo, max: hi };
   const a = lo * scale;
   const b = hi * scale;
   return a <= b ? { min: a, max: b } : { min: b, max: a };
@@ -182,59 +142,66 @@ export function physicalRange(
 
 /** Decode raw words into a typed, scaled value.
  *
- *  Mirrors `decode_value`: reorder → assemble big-endian → apply scale, with
- *  integer datatypes truncated toward zero after scaling. */
+ *  Floats and scaled integers decode to a number; an unscaled integer stays
+ *  exact, a 64-bit one as a `bigint`. */
 export function decodeValue(
   words: readonly number[],
   datatype: ModbusDatatype,
   scale = 1,
   byteOrder: ByteOrder = "big",
 ): DecodedValue {
-  const regs = reorderWords(words, byteOrder);
-  if (datatype === "bool") {
-    return Boolean(at(regs, 0));
-  }
+  if (datatype === "bool") return Boolean(at(words, 0));
   const need = wordCount(datatype);
-  if (regs.length < need) {
-    throw new Error(`${datatype} needs ${need} word(s) to decode, got ${regs.length}`);
+  if (words.length < need) {
+    throw new Error(`${datatype} needs ${need} word(s) to decode, got ${words.length}`);
   }
-  const view = wordsToView(regs.slice(0, need));
+  const view = wordsToView(reorderWords(words.slice(0, need), byteOrder));
+  let raw: number | bigint;
   switch (datatype) {
     case "uint16":
-      return truncScaled(view.getUint16(0), scale);
+      raw = view.getUint16(0);
+      break;
     case "int16":
-      return truncScaled(view.getInt16(0), scale);
+      raw = view.getInt16(0);
+      break;
     case "uint32":
-      return truncScaled(view.getUint32(0), scale);
+      raw = view.getUint32(0);
+      break;
     case "int32":
-      return truncScaled(view.getInt32(0), scale);
+      raw = view.getInt32(0);
+      break;
     case "float32":
-      return view.getFloat32(0) * scale;
+      raw = view.getFloat32(0);
+      break;
     case "float64":
-      return view.getFloat64(0) * scale;
+      raw = view.getFloat64(0);
+      break;
     case "uint64":
-    case "int64": {
-      const raw = datatype === "uint64" ? view.getBigUint64(0) : view.getBigInt64(0);
-      // Divergence (1): keep full precision when there is nothing to scale.
-      // Python's `int(raw * 1.0)` would round-trip through a double here.
-      if (scale === 1) return raw;
-      return truncScaled(Number(raw), scale);
-    }
+      raw = view.getBigUint64(0);
+      break;
+    case "int64":
+      raw = view.getBigInt64(0);
+      break;
   }
+  return scale === 1 ? raw : applyScale(Number(raw), scale);
 }
 
-/** Encode a typed value into raw words (scale applied, then byte order).
- *
- *  Mirrors `encode_value`, except that values outside the datatype's raw range
- *  throw before any word is produced — see divergence (2) in the file header. */
+/** `raw * scale`, except that a 1/n scale divides by n: 2305 / 10 is exact where
+ *  2305 * 0.1 is not. */
+function applyScale(raw: number, scale: number): number {
+  const inverse = Math.abs(scale) > 0 && Math.abs(scale) < 1 ? Math.round(1 / scale) : 0;
+  if (inverse !== 0 && Math.abs(inverse * scale - 1) < 1e-12) return raw / inverse;
+  return raw * scale;
+}
+
+/** Encode a typed value into raw words: divided by the scale, integers rounded to
+ *  nearest (halves up), then reordered. Out of range throws. */
 export function encodeValue(
   value: number | boolean | bigint,
   datatype: ModbusDatatype,
   scale = 1,
   byteOrder: ByteOrder = "big",
 ): number[] {
-  // `bool` ignores the scale entirely, exactly as the Python branch does
-  // (`regs = [1 if value else 0]` uses the unscaled value).
   if (datatype === "bool") return [value ? 1 : 0];
 
   const need = wordCount(datatype);
@@ -252,7 +219,7 @@ export function encodeValue(
       case "int16":
       case "uint32":
       case "int32": {
-        const n = truncToward0(scaled);
+        const n = roundHalfUp(scaled);
         assertInRange(n, datatype);
         if (datatype === "uint16") view.setUint16(0, n);
         else if (datatype === "int16") view.setInt16(0, n);
@@ -307,12 +274,6 @@ const INTEGER_DATATYPES: ReadonlySet<ModbusDatatype> = new Set<ModbusDatatype>([
 
 const SIXTY_FOUR_BIT: ReadonlySet<ModbusDatatype> = new Set<ModbusDatatype>(["uint64", "int64"]);
 
-/** How far off a whole raw count a scaled draft may land before we call it
- *  fractional. Dividing by a decimal scale is inexact in binary floating point —
- *  `100.5 / 0.1` is `1004.9999999999999` — so the test has to be a tolerance, not
- *  an equality. */
-const STEP_TOLERANCE = 1e-9;
-
 /** Largest integer JSON can carry without losing a digit. */
 const MAX_EXACT_JSON_INT = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -352,23 +313,22 @@ export function parseWriteDraft(
 
   const parsed = Number(trimmed);
   if (!Number.isFinite(parsed)) return { value: null, error: "not a number" };
-  const step = stepError(parsed, datatype, scale);
-  if (step !== null) return { value: null, error: step };
   const verdict = validateWriteValue(parsed, datatype, scale);
   if (!verdict.ok) return { value: null, error: verdict.error };
+  const step = stepError(parsed, datatype, scale);
+  if (step !== null) return { value: null, error: step };
   return { value: parsed, error: null };
 }
 
-/** Refuse a draft the encoder would quietly truncate, and say what it would have
- *  written instead. A draft the scale makes whole (`100.5` at `×0.1` is raw 1005)
- *  is not fractional and passes. */
+/** Refuse a draft the encoder would round, naming what it would write instead,
+ *  with the extension's tolerance: exact in raw counts, up to float error in
+ *  `value / scale`. A draft the scale makes whole (`100.5` at `×0.1`) passes. */
 function stepError(value: number, datatype: ModbusDatatype, scale: number): string | null {
   if (!INTEGER_DATATYPES.has(datatype)) return null;
-  const divisor = scale !== 0 && Number.isFinite(scale) ? scale : 1;
-  const raw = value / divisor;
-  const nearest = Math.round(raw);
-  if (Math.abs(raw - nearest) <= STEP_TOLERANCE * Math.max(1, Math.abs(raw))) return null;
-  const writable = truncToward0(raw) * divisor;
+  const steps = scale === 1 ? value : value / scale;
+  const error = Math.abs(steps - Math.floor(steps + 0.5));
+  if (error <= Math.max(1e-9, 4 * Number.EPSILON * Math.abs(steps))) return null;
+  const writable = decodeValue(encodeValue(value, datatype, scale), datatype, scale);
   return `${formatDecodedValue(value)} is not a whole ${datatype} step — nearest writable value is ${formatDecodedValue(writable)}`;
 }
 
@@ -379,28 +339,25 @@ export function formatWordsHex(words: readonly number[]): string {
   return words.map((w) => `0x${(w & 0xffff).toString(16).padStart(4, "0")}`).join(" ");
 }
 
-/** `100` → `"100 (0x0064)"` — decimal is what users type, hex is what device
- *  documentation prints. */
-export function formatAddress(address: number): string {
-  return `${address} (0x${address.toString(16).padStart(4, "0")})`;
+/** `101` at base 1 → `"101 (0x0064)"`: the decimal address in the device's
+ *  numbering, and the 0-based wire address in hex, as datasheets print it. */
+export function formatAddress(address: number, base: number): string {
+  return `${address} (0x${(address - base).toString(16).padStart(4, "0")})`;
 }
 
-/** Parse a user-entered address, accepting decimal (`"100"`) or hex
- *  (`"0x64"`, `"0X64"`). Returns null for anything that isn't a whole address
- *  in `[0, 65535]`. */
-export function parseAddress(input: string): number | null {
+/** A user-entered address in the device's numbering, as {@link formatAddress}
+ *  prints it: decimal (`"101"`) is in the device's numbering, and hex (`"0x64"`)
+ *  is the 0-based wire address. Null for anything that isn't a whole decimal in
+ *  `[0, 65536]` or a hex wire address in `[0, 0xffff]`. */
+export function parseAddress(input: string, base: number): number | null {
   const text = input.trim();
-  if (text.length === 0) return null;
-  let value: number;
   if (/^0[xX][0-9a-fA-F]+$/.test(text)) {
-    value = Number.parseInt(text.slice(2), 16);
-  } else if (/^[0-9]+$/.test(text)) {
-    value = Number.parseInt(text, 10);
-  } else {
-    return null;
+    const wire = Number.parseInt(text.slice(2), 16);
+    return wire <= 0xffff ? wire + base : null;
   }
-  if (!Number.isInteger(value) || value < 0 || value > 65535) return null;
-  return value;
+  if (!/^[0-9]+$/.test(text)) return null;
+  const value = Number.parseInt(text, 10);
+  return value <= 0x10000 ? value : null;
 }
 
 /** Can this value be printed, and offered back as a write default?
@@ -409,14 +366,17 @@ export function parseAddress(input: string): number | null {
  *  what the extension sends when a value isn't JSON-representable, and a
  *  non-finite number, which is what a client-side decode of the same words
  *  produces. Neither is a missing sample — the read happened. */
-export function isRepresentable(value: DecodedValue | null): value is DecodedValue {
+export function isRepresentable(
+  value: DecodedValue | string | null,
+): value is DecodedValue | string {
   return value !== null && (typeof value !== "number" || Number.isFinite(value));
 }
 
 /** Display form for a decoded value. Booleans read as ON/OFF (the wire idiom
  *  for coils); 64-bit integers stay strings so nothing is rounded on the way
  *  to the DOM. */
-export function formatDecodedValue(value: DecodedValue): string {
+export function formatDecodedValue(value: DecodedValue | string): string {
+  if (typeof value === "string") return value;
   if (typeof value === "boolean") return value ? "ON" : "OFF";
   if (typeof value === "bigint") return value.toString();
   if (!Number.isFinite(value)) return String(value);
@@ -451,15 +411,11 @@ function wordsToView(words: readonly number[]): DataView {
   return view;
 }
 
-/** `int(x)` semantics — truncate toward zero, normalizing `-0` to `0` so
- *  strict-equality assertions and React keys behave. */
-function truncToward0(x: number): number {
-  const t = Math.trunc(x);
-  return t === 0 ? 0 : t;
-}
-
-function truncScaled(raw: number, scale: number): number {
-  return truncToward0(raw * scale);
+/** Nearest whole number, halves up, as the extension's `math.floor(x + 0.5)`;
+ *  `-0` normalized to `0`. */
+function roundHalfUp(x: number): number {
+  const n = Math.floor(x + 0.5);
+  return n === 0 ? 0 : n;
 }
 
 function scaledNumber(
@@ -471,8 +427,7 @@ function scaledNumber(
   if (!Number.isFinite(n)) {
     throw new Error(`${datatype} value must be a finite number, got ${String(value)}`);
   }
-  // `scale == 0` guard mirrors Python: an unset/zero scale writes the value as-is.
-  return scale !== 0 && Number.isFinite(scale) ? n / scale : n;
+  return scale === 1 ? n : n / scale;
 }
 
 function scaledBigInt(
@@ -480,12 +435,10 @@ function scaledBigInt(
   datatype: ModbusDatatype,
   scale: number,
 ): bigint {
-  let scaled: bigint;
-  if (typeof value === "bigint" && (scale === 1 || scale === 0)) {
-    scaled = value;
-  } else {
-    scaled = BigInt(truncToward0(scaledNumber(value, datatype, scale)));
-  }
+  const scaled =
+    typeof value === "bigint" && scale === 1
+      ? value
+      : BigInt(roundHalfUp(scaledNumber(value, datatype, scale)));
   assertInRange(scaled, datatype);
   return scaled;
 }

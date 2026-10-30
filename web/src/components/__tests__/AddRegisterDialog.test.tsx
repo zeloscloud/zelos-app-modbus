@@ -39,7 +39,8 @@ function renderDialog({ registers = CATALOG }: { registers?: readonly RegisterEn
     <AddRegisterDialog
       open
       onOpenChange={onOpenChange}
-      interfaceName="meter"
+      deviceName="meter"
+      addressBase={1}
       registers={registers}
       onAdd={onAdd}
       onAddRaw={onAddRaw}
@@ -72,10 +73,10 @@ describe("AddRegisterDialog", () => {
     }
   });
 
-  it("shows each register's address in dec + hex, table, datatype and unit", () => {
+  it("shows each register's address, its wire address in hex, table, datatype and unit", () => {
     renderDialog();
     const row = option("temperature");
-    expect(within(row).getByText("20 (0x0014)")).toBeInTheDocument();
+    expect(within(row).getByText("20 (0x0013)")).toBeInTheDocument();
     expect(within(row).getByText("holding")).toBeInTheDocument();
     expect(within(row).getByText("int16")).toBeInTheDocument();
     expect(within(row).getByText("°C")).toBeInTheDocument();
@@ -146,7 +147,7 @@ describe("AddRegisterDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("offers the raw row even when the interface has no register map", () => {
+  it("offers the raw row even when the device has no register map", () => {
     const { onAddRaw } = renderDialog({ registers: [] });
     expect(screen.getByText(/no register map/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /add raw row/i }));

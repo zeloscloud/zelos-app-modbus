@@ -1,11 +1,11 @@
-/** localStorage-backed rows for an interface's one register table, plus the pure
+/** localStorage-backed rows for a device's one register table, plus the pure
  *  "what request would this raw row issue" planners.
  *
  *  Two kinds of row share one list, one storage key and one insertion order:
  *
  *  - **named** rows are catalog registers the user picked. They store IDENTITY
  *    ONLY (`path`); address, table, datatype, unit, scale, word order,
- *    writability and poll interval are all joined live from `list_registers`, so
+ *    writability and poll rate are all joined live from `list_registers`, so
  *    a row can never show metadata the extension has since changed. A path that
  *    has disappeared from the map renders as an orphan the user can delete.
  *  - **raw** rows are arbitrary-address access. The agent knows nothing about
@@ -33,7 +33,13 @@ import {
   readWordCount,
   type DecodedValue,
 } from "./codec";
-import type { ByteOrder, ModbusDatatype, RawReadResult, RegisterTableType } from "./types";
+import type {
+  ByteOrder,
+  ModbusDatatype,
+  ModbusDeviceEntry,
+  RawReadResult,
+  RegisterTableType,
+} from "./types";
 import { errorMessage } from "./utils";
 
 const STORAGE_KEY = "zelos-app-modbus.watch-rows.v1";
@@ -42,7 +48,7 @@ interface RowIdentity {
   /** Stable local id. Generated client-side so localStorage owns identity. */
   id: string;
   agent: string;
-  interface: string;
+  device: string;
   /** The write editor's text, kept as typed, so a row can act as a one-click
    *  preset: several rows on the same register, each holding the value it writes. */
   draft?: string;
@@ -78,12 +84,13 @@ export type RowPatch = { draft?: string } & Partial<
   Pick<RawWatchRow, "address" | "table" | "datatype" | "byte_order">
 >;
 
-export function defaultRawRow(agent: string, iface: string): NewWatchRow {
+/** A raw row on the device's first address. */
+export function defaultRawRow(agent: string, device: ModbusDeviceEntry): NewWatchRow {
   return {
     kind: "raw",
     agent,
-    interface: iface,
-    address: "0",
+    device: device.name,
+    address: String(device.address_base),
     table: "holding",
     datatype: "uint16",
     byte_order: "big",
@@ -172,13 +179,13 @@ export function saveRows(rows: readonly WatchRow[]): void {
 function reviveRow(entry: unknown): WatchRow | null {
   if (entry === null || typeof entry !== "object") return null;
   const r = entry as Record<string, unknown>;
-  if (typeof r.id !== "string" || typeof r.agent !== "string" || typeof r.interface !== "string") {
+  if (typeof r.id !== "string" || typeof r.agent !== "string" || typeof r.device !== "string") {
     return null;
   }
   const identity: RowIdentity = {
     id: r.id,
     agent: r.agent,
-    interface: r.interface,
+    device: r.device,
     ...(typeof r.draft === "string" ? { draft: r.draft } : {}),
   };
 
@@ -248,13 +255,12 @@ export function rawTargetKey(row: RawWatchRow): string {
 /** The single-value read a raw row stands for, or the reason it can't be
  *  issued. Every validation the UI shows lives here so the inline error and the
  *  wire call can never disagree. */
-export function planRawRead(row: RawWatchRow): Planned<RawReadPlan> {
-  const address = parseAddress(row.address);
+export function planRawRead(row: RawWatchRow, base: number): Planned<RawReadPlan> {
+  const address = parseAddress(row.address, base);
   if (address === null) return { ok: false, error: addressError(row.address) };
   const count = readWordCount(row.table, row.datatype, 1);
-  if (address + count - 1 > 65535) {
-    return { ok: false, error: "The read runs past address 65535" };
-  }
+  const outside = rangeError(address, count, base);
+  if (outside !== null) return { ok: false, error: outside };
   return { ok: true, plan: { address, table: row.table, count } };
 }
 
@@ -264,11 +270,14 @@ export function planRawRead(row: RawWatchRow): Planned<RawReadPlan> {
 export function planRawWrite(
   row: RawWatchRow,
   value: number | boolean | bigint,
+  base: number,
 ): Planned<RawWritePlan> {
-  const address = parseAddress(row.address);
+  const address = parseAddress(row.address, base);
   if (address === null) return { ok: false, error: addressError(row.address) };
   if (!isWritableTable(row.table)) return { ok: false, error: readOnlyReason(row.table) };
   if (isBitTable(row.table)) {
+    const outside = rangeError(address, 1, base);
+    if (outside !== null) return { ok: false, error: outside };
     return {
       ok: true,
       plan: { kind: "coil", address, on: typeof value === "boolean" ? value : value !== 0 },
@@ -285,9 +294,8 @@ export function planRawWrite(
   } catch (e) {
     return { ok: false, error: errorMessage(e) };
   }
-  if (address + words.length - 1 > 65535) {
-    return { ok: false, error: "The write runs past address 65535" };
-  }
+  const outside = rangeError(address, words.length, base);
+  if (outside !== null) return { ok: false, error: outside };
   const [first] = words;
   if (words.length === 1 && first !== undefined) {
     return { ok: true, plan: { kind: "single", address, word: first } };
@@ -305,7 +313,7 @@ export function planRawWrite(
  *  of a raw read is that the words are the truth. */
 export function interpretRawRead(row: RawWatchRow, res: RawReadResult): RawReadout {
   // `values` is number[] for the word tables and boolean[] for the bit tables.
-  const values: Array<number | boolean> = res.values ?? [];
+  const values: Array<number | boolean> = res.values;
   if (isBitTable(row.table)) {
     if (values.length !== 1) throw new Error(`expected 1 bit, got ${values.length}`);
     const first = values[0];
@@ -333,5 +341,11 @@ export function interpretRawRead(row: RawWatchRow, res: RawReadResult): RawReado
 }
 
 function addressError(address: string): string {
-  return `Address "${address}" is not a value in 0…65535 (dec or 0x)`;
+  return `Address "${address}" is neither a decimal 0…65536 nor a 0x wire address 0x0000…0xffff`;
+}
+
+/** The extension's own bound: `count` addresses from `address`, numbered from `base`. */
+function rangeError(address: number, count: number, base: number): string | null {
+  if (address >= base && address + count <= 0x10000 + base) return null;
+  return `Address ${address} (count ${count}) is outside ${base}-${0xffff + base} (address base ${base})`;
 }

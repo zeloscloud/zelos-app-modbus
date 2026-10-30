@@ -3,56 +3,42 @@
 import type { ExtensionEntry } from "@zeloscloud/app-extension-sdk";
 import { describe, expect, it } from "vitest";
 
+import { deviceEntry } from "@/components/__tests__/register-fixtures";
+
 import { discoverModbus, remediation, resolveAgentStatus, type DiscoverInputs } from "./capability";
 import {
   MODBUS_EXTENSION_ID,
   REQUIRED_MODBUS_METHODS,
   modbusActionPath,
-  type ModbusInterfaceEntry,
+  type ModbusDeviceEntry,
 } from "./types";
 
 const runningExt: ExtensionEntry = {
   id: MODBUS_EXTENSION_ID,
   name: "Modbus",
-  version: "0.1.5",
+  version: "0.2.3",
   state: "running",
 };
 
 const localInstallExt: ExtensionEntry = {
   id: "local.modbus",
   name: "Modbus",
-  version: "0.1.5",
+  version: "0.2.3",
   state: "running",
-};
-
-const localRepoInstallExt: ExtensionEntry = {
-  ...localInstallExt,
-  id: "local.zelos-extension-modbus",
 };
 
 const stoppedExt: ExtensionEntry = { ...runningExt, state: "stopped" };
 
-const meter: ModbusInterfaceEntry = {
-  name: "meter",
-  transport: "tcp",
-  connected: true,
-  connection: "127.0.0.1:5020",
-  unit_id: 1,
-  source: "config",
-  map_name: "power_meter",
-  register_count: 24,
-  poll_interval: 1,
-  write_mode: "auto",
-};
+const meter: ModbusDeviceEntry = deviceEntry({ name: "meter_panel/meter" });
 
-const probe: ModbusInterfaceEntry = {
-  ...meter,
-  name: "probe",
+const probe: ModbusDeviceEntry = deviceEntry({
+  name: "rs485/probe",
   transport: "rtu",
-  connection: "/dev/ttyUSB0@9600",
+  endpoint: "/dev/ttyUSB0@9600",
   map_name: null,
   register_count: 0,
-};
+  raw_writes: false,
+});
 
 /** The full set of action paths a healthy Modbus extension registers. */
 function allRequiredActionPaths(): string[] {
@@ -64,7 +50,7 @@ function baseDiscoveryInput(overrides: Partial<DiscoverInputs> = {}): DiscoverIn
     workspaceModeKind: "LIVE",
     extensionsByAgent: { "localhost:2300": [runningExt] },
     actionsByAgent: { "localhost:2300": allRequiredActionPaths() },
-    interfacesByAgent: { "localhost:2300": [meter] },
+    devicesByAgent: { "localhost:2300": [meter] },
     ...overrides,
   };
 }
@@ -72,21 +58,19 @@ function baseDiscoveryInput(overrides: Partial<DiscoverInputs> = {}): DiscoverIn
 // ─── Per-agent resolver ─────────────────────────────────────────────────────
 
 describe("resolveAgentStatus", () => {
-  it("returns ready when the extension runs, actions are registered, and list_interfaces reports at least one interface", () => {
+  it("returns ready when the extension runs, actions are registered, and list_devices reports at least one device", () => {
     const status = resolveAgentStatus("localhost:2300", [runningExt], allRequiredActionPaths(), [
       meter,
     ]);
     expect(status.kind).toBe("ready");
     expect(status.extension).toBe(runningExt);
-    expect(status.interfaces?.map((i) => i.name)).toEqual(["meter"]);
+    expect(status.devices?.map((i) => i.name)).toEqual(["meter_panel/meter"]);
   });
 
-  it("recognizes both local-install ID aliases", () => {
-    for (const ext of [localInstallExt, localRepoInstallExt]) {
-      const status = resolveAgentStatus("a:1", [ext], allRequiredActionPaths(), [meter]);
-      expect(status.kind).toBe("ready");
-      expect(status.extension).toBe(ext);
-    }
+  it("recognizes the local-install ID", () => {
+    const status = resolveAgentStatus("a:1", [localInstallExt], allRequiredActionPaths(), [meter]);
+    expect(status.kind).toBe("ready");
+    expect(status.extension).toBe(localInstallExt);
   });
 
   it("ignores unrelated extensions on the same agent", () => {
@@ -127,6 +111,15 @@ describe("resolveAgentStatus", () => {
     expect(remediation(status)).toBeNull();
   });
 
+  it("returns extension-outdated when the running extension serves its methods under another name", () => {
+    const olderPaths = ["modbus/list_registers", "modbus/read_register", "modbus/get_status"];
+    const status = resolveAgentStatus("a:1", [runningExt], olderPaths, undefined);
+    expect(status).toEqual({ agent: "a:1", kind: "extension-outdated", extension: runningExt });
+    expect(remediation(status)).toBe(
+      "Update the Modbus extension to 0.1.6 or later, then Refresh.",
+    );
+  });
+
   it("returns extension-stopped when the extension exists but is not running", () => {
     expect(resolveAgentStatus("a:1", [stoppedExt], [], undefined)).toMatchObject({
       agent: "a:1",
@@ -135,24 +128,16 @@ describe("resolveAgentStatus", () => {
     });
   });
 
-  it("returns extension-outdated, listing the missing methods", () => {
-    // A 0.1.4-era extension: the pre-existing actions, none of the new ones.
-    const legacy = [
-      modbusActionPath("read_register"),
-      modbusActionPath("write_single_register"),
-      modbusActionPath("write_registers"),
-      modbusActionPath("write_coil"),
-      modbusActionPath("read_named_register"),
-      modbusActionPath("write_named_register"),
-      modbusActionPath("get_status"),
-      modbusActionPath("list_writable_registers"),
-    ];
-    const status = resolveAgentStatus("a:1", [runningExt], legacy, undefined);
+  it("returns extension-outdated when a registered set lacks an action, listing it", () => {
+    const partial = REQUIRED_MODBUS_METHODS.filter((m) => m !== "list_devices").map((m) =>
+      modbusActionPath(m),
+    );
+    const status = resolveAgentStatus("a:1", [runningExt], partial, undefined);
     expect(status.kind).toBe("extension-outdated");
-    expect(status.missingMethods).toEqual(["list_interfaces", "get_snapshot", "list_registers"]);
+    expect(status.missingMethods).toEqual(["list_devices"]);
   });
 
-  it("prefers extension-outdated over the interface list (a stale action set is the real problem)", () => {
+  it("prefers extension-outdated over the device list (a stale action set is the real problem)", () => {
     // One Modbus path registered, so the extension is up and simply too old.
     const status = resolveAgentStatus(
       "a:1",
@@ -166,7 +151,7 @@ describe("resolveAgentStatus", () => {
     );
   });
 
-  it("returns discovery-failed when list_interfaces itself failed", () => {
+  it("returns discovery-failed when list_devices itself failed", () => {
     const status = resolveAgentStatus(
       "a:1",
       [runningExt],
@@ -179,25 +164,25 @@ describe("resolveAgentStatus", () => {
     expect(remediation(status)).toMatch(/connection refused/);
   });
 
-  it("returns discovering-interfaces while list_interfaces is in flight", () => {
+  it("returns discovering-devices while list_devices is in flight", () => {
     const status = resolveAgentStatus("a:1", [runningExt], allRequiredActionPaths(), undefined);
-    expect(status.kind).toBe("discovering-interfaces");
-    expect(status.interfaces).toBeUndefined();
+    expect(status.kind).toBe("discovering-devices");
+    expect(status.devices).toBeUndefined();
   });
 
-  it("returns no-interfaces when list_interfaces resolves empty", () => {
+  it("returns no-devices when list_devices resolves empty", () => {
     const status = resolveAgentStatus("a:1", [runningExt], allRequiredActionPaths(), []);
-    expect(status.kind).toBe("no-interfaces");
+    expect(status.kind).toBe("no-devices");
     expect(status.missingMethods).toBeUndefined();
   });
 
-  it("carries every interface through, in the order the extension reported them", () => {
+  it("carries every device through, in the order the extension reported them", () => {
     const status = resolveAgentStatus("a:1", [runningExt], allRequiredActionPaths(), [
       meter,
       probe,
     ]);
-    expect(status.interfaces?.map((i) => i.name)).toEqual(["meter", "probe"]);
-    expect(status.interfaces?.[1]?.map_name).toBeNull();
+    expect(status.devices?.map((i) => i.name)).toEqual(["meter_panel/meter", "rs485/probe"]);
+    expect(status.devices?.[1]?.map_name).toBeNull();
   });
 });
 
@@ -221,7 +206,7 @@ describe("discoverModbus", () => {
           "localhost:2300": allRequiredActionPaths(),
           "remote:2300": ["can-tx/send"],
         },
-        interfacesByAgent: { "localhost:2300": [meter] },
+        devicesByAgent: { "localhost:2300": [meter] },
       }),
     );
     expect(disc.kind).toBe("ready");
@@ -238,7 +223,7 @@ describe("discoverModbus", () => {
       baseDiscoveryInput({
         extensionsByAgent: { "localhost:2300": [runningExt], "remote:2300": [stoppedExt] },
         actionsByAgent: { "localhost:2300": allRequiredActionPaths(), "alt:2300": [] },
-        interfacesByAgent: { "localhost:2300": [meter] },
+        devicesByAgent: { "localhost:2300": [meter] },
       }),
     );
     expect(disc.kind).toBe("ready");
@@ -263,7 +248,7 @@ describe("discoverModbus", () => {
   it("disabled: no-agents-connected when no agents are present in either fan-out", () => {
     expect(
       discoverModbus(
-        baseDiscoveryInput({ extensionsByAgent: {}, actionsByAgent: {}, interfacesByAgent: {} }),
+        baseDiscoveryInput({ extensionsByAgent: {}, actionsByAgent: {}, devicesByAgent: {} }),
       ),
     ).toEqual({ kind: "disabled", reason: "no-agents-connected" });
   });
@@ -274,7 +259,7 @@ describe("discoverModbus", () => {
         baseDiscoveryInput({
           extensionsByAgent: null,
           actionsByAgent: null,
-          interfacesByAgent: null,
+          devicesByAgent: null,
         }),
       ),
     ).toEqual({ kind: "disabled", reason: "no-agents-connected" });
@@ -285,17 +270,17 @@ describe("discoverModbus", () => {
 
 describe("remediation", () => {
   it("has no copy for healthy or in-flight agents", () => {
-    expect(remediation({ agent: "a", kind: "ready", interfaces: [meter] })).toBeNull();
-    expect(remediation({ agent: "a", kind: "discovering-interfaces" })).toBeNull();
+    expect(remediation({ agent: "a", kind: "ready", devices: [meter] })).toBeNull();
+    expect(remediation({ agent: "a", kind: "discovering-devices" })).toBeNull();
   });
 
-  it("names the version floor when the extension is too old", () => {
+  it("asks for an update when the extension lacks an action", () => {
     const copy = remediation({
       agent: "a",
       kind: "extension-outdated",
       missingMethods: ["get_snapshot"],
     });
-    expect(copy).toMatch(/0\.1\.5\+/);
+    expect(copy).toMatch(/^Update the Modbus extension/);
   });
 
   it("suggests install-local and start commands", () => {
@@ -305,7 +290,7 @@ describe("remediation", () => {
     );
   });
 
-  it("explains an empty interface list", () => {
-    expect(remediation({ agent: "a", kind: "no-interfaces" })).toMatch(/no interfaces configured/i);
+  it("explains an empty device list", () => {
+    expect(remediation({ agent: "a", kind: "no-devices" })).toMatch(/no devices configured/i);
   });
 });

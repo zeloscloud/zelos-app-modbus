@@ -1,7 +1,7 @@
-/** One section per Modbus interface: a live status header, then the one table
+/** One section per Modbus device: a live status header, then the one table
  *  holding every row the user added to it — catalog registers and arbitrary
- *  addresses side by side, in insertion order. An interface with no register map
- *  has an empty catalog, so only raw rows can be added to it. */
+ *  addresses side by side, in insertion order. A device with no registers has an
+ *  empty catalog, so only raw rows can be added to it. */
 
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { AlertCircle, Loader2, Plus } from "lucide-react";
@@ -13,7 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useRegisters } from "@/hooks/use-registers";
 import { useSnapshot } from "@/hooks/use-snapshot";
-import type { ModbusInterfaceEntry, RegisterEntry } from "@/lib/types";
+import type { ModbusDeviceEntry, RegisterEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { defaultRawRow, type NewWatchRow, type RowPatch, type WatchRow } from "@/lib/watch-store";
 
@@ -26,35 +26,29 @@ const NOW_TICK_MS = 1_000;
 
 const NO_REGISTERS: readonly RegisterEntry[] = [];
 
-export interface InterfacePanelProps {
+export interface DevicePanelProps {
   bridge: BridgeTransport;
   agentAddress: string;
-  iface: ModbusInterfaceEntry;
-  /** Rows already filtered to this (agent, interface), in insertion order. */
+  device: ModbusDeviceEntry;
+  /** Rows already filtered to this (agent, device), in insertion order. */
   rows: readonly WatchRow[];
   onAddRow: (input: NewWatchRow) => WatchRow;
   onUpdateRow: (id: string, patch: RowPatch) => void;
   onRemoveRow: (id: string) => void;
 }
 
-export function InterfacePanel({
+export function DevicePanel({
   bridge,
   agentAddress,
-  iface,
+  device,
   rows,
   onAddRow,
   onUpdateRow,
   onRemoveRow,
-}: InterfacePanelProps) {
+}: DevicePanelProps) {
   const [pickerOpen, setPickerOpen] = React.useState(false);
-  const snapshotQuery = useSnapshot(bridge, agentAddress, iface.name);
-  const registersQuery = useRegisters(
-    bridge,
-    agentAddress,
-    iface.name,
-    iface.map_name,
-    iface.register_count,
-  );
+  const snapshotQuery = useSnapshot(bridge, agentAddress, device.name);
+  const registersQuery = useRegisters(bridge, agentAddress, device);
 
   const snapshot = snapshotQuery.data;
   const snapshotError = snapshotQuery.error instanceof Error ? snapshotQuery.error : null;
@@ -65,32 +59,33 @@ export function InterfacePanel({
   const registers = registersQuery.data?.registers ?? NO_REGISTERS;
   const catalogError = registersQuery.error instanceof Error ? registersQuery.error : null;
   // Named rows would flash as orphans if they rendered before the catalog they
-  // join against, so a mapped interface waits for it. Raw rows don't care.
-  const catalogPending = iface.map_name !== null && registersQuery.isLoading;
-  // An interface with no map has nothing to join against and never will, so a
-  // named row on it really is orphaned. A catalog that failed to load says
-  // nothing about any row — those rows keep working on their paths alone.
-  const catalogReady = iface.map_name === null || registersQuery.isSuccess;
+  // join against, so a device with registers waits for it. Raw rows don't care.
+  const hasCatalog = device.register_count > 0;
+  const catalogPending = hasCatalog && registersQuery.isLoading;
+  // A device with no registers has nothing to join against, so a named row on it
+  // really is orphaned. A catalog that failed to load says nothing about any row:
+  // those rows keep working on their paths alone.
+  const catalogReady = !hasCatalog || registersQuery.isSuccess;
   const retryCatalog = registersQuery.refetch;
 
   const openPicker = React.useCallback(() => setPickerOpen(true), []);
   const addRegister = React.useCallback(
     (reg: RegisterEntry) =>
-      onAddRow({ kind: "named", agent: agentAddress, interface: iface.name, path: reg.path }),
-    [onAddRow, agentAddress, iface.name],
+      onAddRow({ kind: "named", agent: agentAddress, device: device.name, path: reg.path }),
+    [onAddRow, agentAddress, device.name],
   );
   const addRawRow = React.useCallback(
-    () => onAddRow(defaultRawRow(agentAddress, iface.name)),
-    [onAddRow, agentAddress, iface.name],
+    () => onAddRow(defaultRawRow(agentAddress, device)),
+    [onAddRow, agentAddress, device],
   );
 
   return (
     <div className="rounded-lg border border-border bg-background/40">
       <div className="flex flex-col gap-1 px-3 py-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
-          <strong className="text-sm">{iface.name}</strong>
+          <strong className="text-sm">{device.name}</strong>
           <Badge variant="outline" className="font-mono">
-            {iface.transport.toUpperCase()} {iface.connection}
+            {device.transport.toUpperCase()} {device.endpoint}
           </Badge>
           {snapshotError ? (
             <Badge variant="destructive" className="gap-1">
@@ -105,19 +100,19 @@ export function InterfacePanel({
           ) : (
             <ConnectionBadge connected={snapshot.connected} stale={stale} />
           )}
-          {iface.map_name !== null ? (
-            <span className="text-muted-foreground">map {iface.map_name}</span>
+          {device.map_name !== null ? (
+            <span className="text-muted-foreground">map {device.map_name}</span>
           ) : (
-            <Badge variant="warning">raw only</Badge>
+            !hasCatalog && <Badge variant="warning">raw only</Badge>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[11px] text-muted-foreground">
-          <span>unit {iface.unit_id}</span>
+          <span>unit {device.unit_id}</span>
           <span>polls {snapshot?.poll_count ?? "—"}</span>
-          <span>errors {snapshot?.error_count ?? "—"}</span>
-          <span>every {iface.poll_interval}s</span>
-          <span>write {iface.write_mode}</span>
-          <span>{iface.register_count} regs</span>
+          <span>errors {snapshot?.failed_reads ?? "—"}</span>
+          <span>{device.rate > 0 ? `every ${device.rate}s` : "not polled"}</span>
+          <span>write {device.write_mode}</span>
+          <span>{device.register_count} regs</span>
         </div>
         {snapshotError && <p className="text-[11px] text-destructive">{snapshotError.message}</p>}
       </div>
@@ -165,8 +160,7 @@ export function InterfacePanel({
             <RegisterTable
               bridge={bridge}
               agentAddress={agentAddress}
-              interfaceName={iface.name}
-              interfacePollInterval={iface.poll_interval}
+              device={device}
               registers={registers}
               rows={rows}
               catalogReady={catalogReady}
@@ -179,7 +173,8 @@ export function InterfacePanel({
             <AddRegisterDialog
               open={pickerOpen}
               onOpenChange={setPickerOpen}
-              interfaceName={iface.name}
+              deviceName={device.name}
+              addressBase={device.address_base}
               registers={registers}
               onAdd={addRegister}
               onAddRaw={addRawRow}
