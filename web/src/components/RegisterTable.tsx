@@ -177,7 +177,8 @@ export function RegisterTable({
   }
 
   return (
-    <div className="overflow-x-auto rounded-md border border-border">
+    // Positioned, so sr-only text in the cells can't widen the page past the scroller.
+    <div className="relative overflow-x-auto rounded-md border border-border">
       <table className="w-full min-w-[860px] table-fixed text-xs">
         {/* Table/Type/Unit are sized to the editors a raw row puts in them and no
             more; every pixel saved there is spent on Value and Write. */}
