@@ -1,0 +1,219 @@
+/** Orchestration shell. One AgentPanel per discovered agent; the localStorage row
+ *  list lives here so rows survive device/agent re-renders and can be filtered
+ *  per (agent, device) on the way down. */
+
+import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
+import { useExtensionInfo, useZelosBridge } from "@zeloscloud/app-extension-sdk/react";
+import { Copy, RefreshCw, Trash2 } from "lucide-react";
+import React from "react";
+import { toast } from "sonner";
+
+import { AgentPanel } from "@/components/AgentPanel";
+import { CapabilityBanner } from "@/components/CapabilityBanner";
+import { Button } from "@/components/ui/button";
+import { useModbusDiscovery } from "@/hooks/use-capability";
+import { useWatchRows } from "@/hooks/use-watch-rows";
+import type { AgentStatus } from "@/lib/capability";
+import { copyToClipboard } from "@/lib/clipboard";
+import type { WorkspaceModeKind } from "@/lib/types";
+import { rowLabel, type WatchRow } from "@/lib/watch-store";
+
+/** Shared empty identity, so an agent with no rows doesn't re-render on it. */
+const NO_ROWS: readonly WatchRow[] = [];
+
+export function App() {
+  const bridge = useZelosBridge();
+  const info = useExtensionInfo();
+
+  if (bridge.status === "loading") {
+    return <CenteredMessage>Connecting to Zelos…</CenteredMessage>;
+  }
+  if (bridge.status === "error") {
+    return <CenteredMessage variant="error">{bridge.error.message}</CenteredMessage>;
+  }
+
+  return (
+    <main className="min-h-screen bg-background p-6 space-y-4">
+      <header>
+        <h1 className="text-xl font-semibold">{info?.name ?? "Modbus Control"}</h1>
+        <p className="text-xs text-muted-foreground">
+          {info?.id} · v{info?.version}
+        </p>
+      </header>
+
+      <DiscoveryView
+        bridge={bridge.bridge}
+        bridgeMode={bridge.mode}
+        workspaceModeKind={bridge.workspace?.modeKind ?? "NONE"}
+        appId={info?.id ?? null}
+        appVersion={info?.version ?? null}
+      />
+    </main>
+  );
+}
+
+function DiscoveryView({
+  bridge,
+  bridgeMode,
+  workspaceModeKind,
+  appId,
+  appVersion,
+}: {
+  bridge: BridgeTransport;
+  bridgeMode: "embedded" | "standalone";
+  workspaceModeKind: WorkspaceModeKind;
+  appId: string | null;
+  appVersion: string | null;
+}) {
+  const { discovery, isLoading, refetch } = useModbusDiscovery({ bridge, workspaceModeKind });
+  const { rows, addRow, updateRow, removeRow } = useWatchRows();
+
+  // Group once here rather than filtering the whole list per agent per render.
+  const rowsByAgent = React.useMemo(() => {
+    const byAgent = new Map<string, WatchRow[]>();
+    for (const row of rows) {
+      const existing = byAgent.get(row.agent);
+      if (existing) existing.push(row);
+      else byAgent.set(row.agent, [row]);
+    }
+    return byAgent;
+  }, [rows]);
+
+  const handleCopyLogs = React.useCallback(async () => {
+    const log = {
+      timestamp: new Date().toISOString(),
+      app: { id: appId, version: appVersion },
+      bridge: { mode: bridgeMode, workspaceMode: workspaceModeKind },
+      discovery,
+      rows,
+    };
+    const text = JSON.stringify(log, null, 2);
+    console.log("[MODBUS debug log]\n" + text);
+    if (await copyToClipboard(text)) toast.success("Copied to clipboard");
+    else toast.error("Clipboard blocked — see devtools console");
+  }, [appId, appVersion, bridgeMode, workspaceModeKind, discovery, rows]);
+
+  if (discovery.kind === "disabled") {
+    return <CapabilityBanner reason={discovery.reason} onRefresh={refetch} />;
+  }
+
+  if (isLoading && discovery.agents.length === 0) {
+    return <CenteredMessage>Discovering agents…</CenteredMessage>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-muted-foreground">
+          {discovery.agents.length} agent{discovery.agents.length === 1 ? "" : "s"} · {bridgeMode}
+        </p>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleCopyLogs}
+            title="Copy a JSON debug snapshot to the clipboard"
+          >
+            <Copy className="h-3 w-3" />
+            Copy logs
+          </Button>
+          <Button variant="outline" size="sm" onClick={refetch}>
+            <RefreshCw className="h-3 w-3" />
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-4">
+        {discovery.agents.map((agent) => (
+          <AgentPanel
+            key={agent.agent}
+            bridge={bridge}
+            agent={agent}
+            rows={rowsByAgent.get(agent.agent) ?? NO_ROWS}
+            onAddRow={addRow}
+            onUpdateRow={updateRow}
+            onRemoveRow={removeRow}
+            onRefresh={refetch}
+          />
+        ))}
+      </div>
+
+      <StrandedRows rows={strandedRows(rows, discovery.agents)} onRemoveRow={removeRow} />
+    </div>
+  );
+}
+
+/** Rows whose device isn't on screen — the agent is gone, the extension is
+ *  down, or the device was renamed. They are never pruned automatically (a
+ *  disconnected agent is usually temporary, and a deleted bench setup is not
+ *  recoverable), so they get somewhere to be seen and deleted from. */
+function StrandedRows({
+  rows,
+  onRemoveRow,
+}: {
+  rows: readonly WatchRow[];
+  onRemoveRow: (id: string) => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <details className="rounded-lg border border-border bg-background/40 px-3 py-2">
+      <summary className="cursor-pointer text-xs text-muted-foreground">
+        Rows for unavailable devices ({rows.length})
+      </summary>
+      <ul className="mt-2 flex flex-col gap-1">
+        {rows.map((row) => (
+          <li key={row.id} className="flex items-center gap-2 text-xs">
+            <span className="min-w-0 flex-1 truncate font-mono text-[11px]">
+              {row.agent} · {row.device} · {rowLabel(row)}
+            </span>
+            <Button
+              size="icon"
+              variant="ghost"
+              className="h-6 w-6 shrink-0"
+              onClick={() => onRemoveRow(row.id)}
+              title={`Remove ${rowLabel(row)} from the table`}
+              aria-label={`Remove ${rowLabel(row)} from the table`}
+            >
+              <Trash2 className="h-3 w-3" />
+            </Button>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+/** Rows that no rendered panel covers. An agent that is still discovering counts
+ *  as covering nothing yet — its rows appear here only if it never resolves,
+ *  which is the case worth surfacing. */
+export function strandedRows(
+  rows: readonly WatchRow[],
+  agents: readonly AgentStatus[],
+): readonly WatchRow[] {
+  const shown = new Set<string>();
+  for (const agent of agents) {
+    for (const device of agent.devices ?? []) shown.add(`${agent.agent}\u0000${device.name}`);
+  }
+  return rows.filter((row) => !shown.has(`${row.agent}\u0000${row.device}`));
+}
+
+function CenteredMessage({
+  children,
+  variant = "info",
+}: {
+  children: React.ReactNode;
+  variant?: "info" | "error";
+}) {
+  return (
+    <div className="flex min-h-[40vh] items-center justify-center">
+      <p
+        className={
+          variant === "error" ? "text-sm text-destructive" : "text-sm text-muted-foreground"
+        }
+      >
+        {children}
+      </p>
+    </div>
+  );
+}

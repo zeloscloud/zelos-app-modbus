@@ -8,25 +8,30 @@ repos:
       - id: check-yaml
       - id: check-json
       - id: pretty-format-json
-        exclude: ^package-lock.json
+        exclude: ^web/
         args: [--autofix, --no-sort-keys]
       - id: end-of-file-fixer
       - id: trailing-whitespace
 
-  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: "v4.0.0-alpha.8"
+  # Agent runtime: ruff runs on Python files only.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.16.10"
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Web project: Prettier and ESLint run from web/node_modules, at the versions package.json locks.
+  - repo: local
     hooks:
       - id: prettier
-        additional_dependencies:
-          - prettier@3
-
-  - repo: https://github.com/pre-commit/mirrors-eslint
-    rev: "v9.27.0"
-    hooks:
+        name: prettier
+        entry: web/node_modules/.bin/prettier --write --ignore-unknown
+        language: system
+        files: ^web/
+        types: [text]
       - id: eslint
-        files: \.(ts|tsx)$
-        additional_dependencies:
-          - eslint@9
-          - typescript-eslint@8
-          - eslint-plugin-react-hooks@5
-          - "@eslint/js@9"
+        name: eslint
+        entry: web/node_modules/.bin/eslint --fix
+        language: system
+        files: ^web/src/.*\.(ts|tsx)$
