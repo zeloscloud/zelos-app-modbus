@@ -1,29 +1,18 @@
-/** Modbus discovery + per-agent capability — pure functions. No React, no IO.
+/** Modbus discovery and per-agent capability, as pure functions.
  *
- *  Discovery model:
- *  1. `extensions.list` tells us which agents have the Modbus extension
- *     installed and what its run state is.
- *  2. `actions.list` tells us which `modbus/<method>` paths are registered.
- *     Every method lives in one global namespace and takes an `interface`
- *     parameter, so the whole REQUIRED_MODBUS_METHODS set should be present on
- *     any healthy extension — a gap means the extension is too old.
- *  3. `modbus/list_interfaces` (one call per agent, after #1 and #2 confirm the
- *     extension is up) returns the configured interfaces. Each entry is a
- *     usable target by definition; per-interface health (connected, poll
- *     counters) comes from the 1 Hz snapshot, not from discovery.
- *
- *  Top-level disabled cases are only the things that aren't per-agent:
- *  workspace not LIVE, or zero agents reachable at all. */
+ *  `extensions.list` says whether the extension is installed and running,
+ *  `actions.list` whether it registers every `Modbus/<method>` this app drives,
+ *  and `Modbus/list_devices` which devices it has configured. Only workspace mode
+ *  and "no agents at all" disable the whole tab. */
 
 import type { ExtensionEntry } from "@zeloscloud/app-extension-sdk";
 
 import {
-  MIN_MODBUS_EXTENSION_VERSION,
   MODBUS_ACTION_PREFIX,
   MODBUS_EXTENSION_INSTALL_IDS,
   REQUIRED_MODBUS_METHODS,
   modbusActionPath,
-  type ModbusInterfaceEntry,
+  type ModbusDeviceEntry,
   type WorkspaceModeKind,
 } from "./types";
 
@@ -35,18 +24,18 @@ type AgentStatusKind =
   | "nothing-registered"
   | "extension-missing"
   | "extension-stopped"
-  /** Running, but not one `modbus/*` path is registered yet — the extension is
+  /** Running, but not one `Modbus/*` path is registered yet — the extension is
    *  still coming up. A moment after Start, every install looks like this. */
   | "extension-starting"
-  /** Running, some `modbus/*` paths registered, and one this app needs is
-   *  missing. That really is an old extension. */
+  /** Running, and either serves this app's methods under another name (an older
+   *  release) or registers some `Modbus/*` paths but lacks one this app needs. */
   | "extension-outdated"
-  /** Running with the full action set, and `list_interfaces` returned zero. */
-  | "no-interfaces"
+  /** Running with the full action set, and `list_devices` returned zero. */
+  | "no-devices"
   /** Extension is up + actions registered, but the discovery RPC hasn't
    *  resolved yet. The UI renders a placeholder header while this loads. */
-  | "discovering-interfaces"
-  /** `list_interfaces` itself failed. Distinct from "still loading", which never
+  | "discovering-devices"
+  /** `list_devices` itself failed. Distinct from "still loading", which never
    *  ends on its own. */
   | "discovery-failed";
 
@@ -56,9 +45,9 @@ export interface AgentStatus {
   /** Present when an extension entry was found, regardless of its run state. */
   extension?: ExtensionEntry;
   /** Present only when `kind === "ready"`. */
-  interfaces?: readonly ModbusInterfaceEntry[];
-  /** Present only when `kind === "extension-outdated"` — the bare method names
-   *  whose action paths were absent. */
+  devices?: readonly ModbusDeviceEntry[];
+  /** Set when `kind === "extension-outdated"` and some `Modbus/*` paths are
+   *  registered — the bare method names whose action paths were absent. */
   missingMethods?: readonly string[];
   /** Present only when `kind === "discovery-failed"`. */
   error?: string;
@@ -77,13 +66,13 @@ export interface DiscoverInputs {
   extensionsByAgent: Record<string, ExtensionEntry[]> | null;
   /** Action paths per agent from `actions.list` (fan-out). */
   actionsByAgent: Record<string, string[]> | null;
-  /** Interfaces per agent from `modbus/list_interfaces` (one call per agent the
+  /** Devices per agent from `Modbus/list_devices` (one call per agent the
    *  hook is willing to query). `undefined` means "not yet fetched"; `[]` means
-   *  "fetched, zero interfaces configured". */
-  interfacesByAgent: Record<string, ModbusInterfaceEntry[] | undefined> | null;
-  /** Message per agent whose `list_interfaces` failed, so a persistent failure
+   *  "fetched, zero devices configured". */
+  devicesByAgent: Record<string, ModbusDeviceEntry[] | undefined> | null;
+  /** Message per agent whose `list_devices` failed, so a persistent failure
    *  reads as failed rather than as forever-loading. */
-  interfaceErrorsByAgent?: Record<string, string | undefined> | null;
+  deviceErrorsByAgent?: Record<string, string | undefined> | null;
 }
 
 /** Top-level discovery: builds the agent list + status, or returns a disabled
@@ -109,8 +98,8 @@ export function discoverModbus(input: DiscoverInputs): ModbusDiscovery {
         agent,
         input.extensionsByAgent?.[agent] ?? [],
         input.actionsByAgent?.[agent] ?? [],
-        input.interfacesByAgent?.[agent],
-        input.interfaceErrorsByAgent?.[agent],
+        input.devicesByAgent?.[agent],
+        input.deviceErrorsByAgent?.[agent],
       ),
     );
   return { kind: "ready", agents };
@@ -121,11 +110,11 @@ export function resolveAgentStatus(
   agent: string,
   extensions: readonly ExtensionEntry[],
   actionPaths: readonly string[],
-  /** Interfaces returned by `modbus/list_interfaces` on this agent, or
+  /** Devices returned by `Modbus/list_devices` on this agent, or
    *  `undefined` if the RPC hasn't completed yet. */
-  interfaces: readonly ModbusInterfaceEntry[] | undefined,
-  /** Why `list_interfaces` failed, if it did. */
-  interfaceError?: string | undefined,
+  devices: readonly ModbusDeviceEntry[] | undefined,
+  /** Why `list_devices` failed, if it did. */
+  deviceError?: string | undefined,
 ): AgentStatus {
   // Both fan-outs empty means the agent said nothing at all, which is what the
   // host reports for an agent it couldn't reach. Claiming the extension is
@@ -144,37 +133,39 @@ export function resolveAgentStatus(
     return { agent, kind: "extension-stopped", extension: ext };
   }
 
-  // Not a single Modbus action yet: the extension process is up but hasn't
-  // registered anything. Every Start passes through this state for a moment, so
-  // it must not read as "your extension is too old".
-  const actionSet = new Set(actionPaths);
-  const hasAnyModbusAction = actionPaths.some((path) => path.startsWith(MODBUS_ACTION_PREFIX));
-  if (!hasAnyModbusAction) {
-    return { agent, kind: "extension-starting", extension: ext };
+  // Every Start passes through "starting" for a moment: the process is up and
+  // has registered nothing yet.
+  if (!actionPaths.some((path) => path.startsWith(MODBUS_ACTION_PREFIX))) {
+    return servesModbusMethodsElsewhere(actionPaths)
+      ? { agent, kind: "extension-outdated", extension: ext }
+      : { agent, kind: "extension-starting", extension: ext };
   }
 
-  // Some paths are registered but one this app drives is absent: the extension
-  // really does predate it.
-  const missing: string[] = [];
-  for (const method of REQUIRED_MODBUS_METHODS) {
-    if (!actionSet.has(modbusActionPath(method))) missing.push(method);
-  }
+  const actionSet = new Set(actionPaths);
+  const missing = REQUIRED_MODBUS_METHODS.filter((m) => !actionSet.has(modbusActionPath(m)));
   if (missing.length > 0) {
     return { agent, kind: "extension-outdated", extension: ext, missingMethods: missing };
   }
 
-  // Action set is good. Now we need the interface list.
-  if (interfaceError !== undefined) {
-    return { agent, kind: "discovery-failed", extension: ext, error: interfaceError };
+  // Action set is good. Now we need the device list.
+  if (deviceError !== undefined) {
+    return { agent, kind: "discovery-failed", extension: ext, error: deviceError };
   }
-  if (interfaces === undefined) {
-    return { agent, kind: "discovering-interfaces", extension: ext };
+  if (devices === undefined) {
+    return { agent, kind: "discovering-devices", extension: ext };
   }
-  if (interfaces.length === 0) {
-    return { agent, kind: "no-interfaces", extension: ext };
+  if (devices.length === 0) {
+    return { agent, kind: "no-devices", extension: ext };
   }
 
-  return { agent, kind: "ready", extension: ext, interfaces };
+  return { agent, kind: "ready", extension: ext, devices };
+}
+
+function servesModbusMethodsElsewhere(actionPaths: readonly string[]): boolean {
+  const methods = new Set<string>(REQUIRED_MODBUS_METHODS);
+  return actionPaths.some(
+    (p) => !p.startsWith(MODBUS_ACTION_PREFIX) && methods.has(p.slice(p.lastIndexOf("/") + 1)),
+  );
 }
 
 /** One-line fix-it copy per failing status. `null` for healthy/in-flight
@@ -184,19 +175,21 @@ export function remediation(status: AgentStatus): string | null {
     case "nothing-registered":
       return "No extensions or actions visible on this agent — it may be unreachable.";
     case "discovery-failed":
-      return `Could not list this agent's interfaces${status.error ? `: ${status.error}` : ""}. Check the extension's logs and its interface config, then Refresh.`;
+      return `Could not list this agent's devices${status.error ? `: ${status.error}` : ""}. Check the extension's logs and its device config, then Refresh.`;
     case "extension-missing":
       return "Install the Modbus extension from the marketplace, or run `zelos extensions install-local <path-to-zelos-extension-modbus>` and Refresh.";
     case "extension-stopped":
       return `Start it with the button above, via the desktop's extensions panel, or run \`zelos extensions start ${status.extension?.id ?? "local.modbus"}\`.`;
     case "extension-outdated":
-      return `Update the Modbus extension to ${MIN_MODBUS_EXTENSION_VERSION}+ — this app needs actions the installed version does not register.`;
-    case "no-interfaces":
-      return "The extension is running but has no interfaces configured. Add one in the extension's config, then Refresh.";
+      return status.missingMethods
+        ? "Update the Modbus extension — this app needs actions the installed version does not register."
+        : "Update the Modbus extension to 0.1.6 or later, then Refresh.";
+    case "no-devices":
+      return "The extension is running but has no devices configured. Add one in the extension's config, then Refresh.";
     // Nothing to fix in either: one is healthy, two are in flight.
     case "ready":
     case "extension-starting":
-    case "discovering-interfaces":
+    case "discovering-devices":
       return null;
   }
 }
