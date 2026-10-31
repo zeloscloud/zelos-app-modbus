@@ -1,11 +1,11 @@
 /** One panel per discovered agent. Header shows the agent address, a status
  *  badge, the Modbus extension version and a start/stop toggle; the body is one
- *  InterfacePanel per interface the extension reported. */
+ *  DevicePanel per device the extension reported. */
 
 import { extensions, type BridgeTransport } from "@zeloscloud/app-extension-sdk";
 import { Loader2, Play, Square } from "lucide-react";
 
-import { InterfacePanel } from "@/components/InterfacePanel";
+import { DevicePanel } from "@/components/DevicePanel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,9 +34,9 @@ export function AgentPanel({
   onRemoveRow,
   onRefresh,
 }: AgentPanelProps) {
-  // `interfaces` is only ever populated on a ready agent, so the kind check the
+  // `devices` is only ever populated on a ready agent, so the kind check the
   // resolver already made doesn't need making again here.
-  const interfaces = agent.interfaces ?? [];
+  const devices = agent.devices ?? [];
   const fixIt = remediation(agent);
 
   return (
@@ -71,8 +71,8 @@ export function AgentPanel({
           </pre>
         ) : null}
 
-        {agent.kind === "discovering-interfaces" && (
-          <p className="text-xs text-muted-foreground">Discovering interfaces…</p>
+        {agent.kind === "discovering-devices" && (
+          <p className="text-xs text-muted-foreground">Discovering devices…</p>
         )}
 
         {agent.kind === "extension-starting" && (
@@ -83,16 +83,16 @@ export function AgentPanel({
         )}
       </CardHeader>
 
-      {interfaces.length > 0 && (
+      {devices.length > 0 && (
         <CardContent className="px-3 pt-2 pb-4">
           <div className="flex flex-col gap-4">
-            {interfaces.map((iface) => (
-              <InterfacePanel
-                key={iface.name}
+            {devices.map((device) => (
+              <DevicePanel
+                key={device.name}
                 bridge={bridge}
                 agentAddress={agent.agent}
-                iface={iface}
-                rows={rows.filter((r) => r.interface === iface.name)}
+                device={device}
+                rows={rows.filter((r) => r.device === device.name)}
                 onAddRow={onAddRow}
                 onUpdateRow={onUpdateRow}
                 onRemoveRow={onRemoveRow}
@@ -108,7 +108,7 @@ export function AgentPanel({
 function AgentBadge({ agent }: { agent: AgentStatus }) {
   switch (agent.kind) {
     case "ready":
-    case "discovering-interfaces":
+    case "discovering-devices":
       return null;
     case "extension-starting":
       return (
@@ -121,8 +121,8 @@ function AgentBadge({ agent }: { agent: AgentStatus }) {
       return <Badge variant="warning">extension stopped</Badge>;
     case "extension-outdated":
       return <Badge variant="warning">extension outdated</Badge>;
-    case "no-interfaces":
-      return <Badge variant="warning">no interfaces</Badge>;
+    case "no-devices":
+      return <Badge variant="warning">no devices</Badge>;
     case "discovery-failed":
       return <Badge variant="destructive">discovery failed</Badge>;
     case "nothing-registered":

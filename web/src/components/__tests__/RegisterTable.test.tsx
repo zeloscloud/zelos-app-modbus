@@ -6,18 +6,28 @@
  *  Sonner is mocked for the whole file so the "success is silent, only failures
  *  toast" contract can be asserted directly. */
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import * as React from "react";
 import { toast } from "sonner";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RegisterTable } from "../RegisterTable";
-import { bridgeStub, namedRow, rawRow, register, snapshot, watchRows } from "./register-fixtures";
+import {
+  bridgeStub,
+  deviceEntry,
+  namedRow,
+  rawRow,
+  register,
+  snapshot,
+  watchRows,
+} from "./register-fixtures";
 import type { BridgeTransport } from "@zeloscloud/app-extension-sdk";
-import type { ModbusSnapshot, RegisterEntry } from "@/lib/types";
+import type { ModbusDeviceEntry, ModbusSnapshot, RegisterEntry } from "@/lib/types";
 import { patchRow, type RawWatchRow, type WatchRow } from "@/lib/watch-store";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+const DEVICE = deviceEntry();
 
 const CATALOG: readonly RegisterEntry[] = [
   register({ event: "power", name: "total", address: 12, unit: "kW" }),
@@ -45,7 +55,7 @@ const CATALOG: readonly RegisterEntry[] = [
     address: 104,
     datatype: "uint32",
     unit: "",
-    poll_interval: 0,
+    rate: 0,
   }),
   register({
     event: "control",
@@ -71,6 +81,7 @@ const COL = {
 
 interface TableOptions {
   rows: readonly WatchRow[];
+  device?: ModbusDeviceEntry;
   registers?: readonly RegisterEntry[];
   /** Defaults to true: most tests are about a table whose catalog loaded. */
   catalogReady?: boolean;
@@ -97,8 +108,7 @@ function renderTable(opts: TableOptions) {
       <RegisterTable
         bridge={bridge}
         agentAddress="localhost:2300"
-        interfaceName="meter"
-        interfacePollInterval={1}
+        device={opts.device ?? DEVICE}
         registers={registers}
         rows={rows}
         catalogReady={opts.catalogReady ?? true}
@@ -201,7 +211,7 @@ describe("RegisterTable columns", () => {
   it("gives the table, the datatype and the unit a column each", () => {
     renderTable({ rows: watchRows(["status/temperature"]) });
     const row = bodyRow();
-    expect(cell(row, COL.address)).toHaveTextContent("20 (0x0014)");
+    expect(cell(row, COL.address)).toHaveTextContent("20 (0x0013)");
     expect(cell(row, COL.table)).toHaveTextContent("holding");
     // Scale rides along with the datatype it applies to.
     expect(cell(row, COL.type)).toHaveTextContent("int16 ×0.1");
@@ -282,7 +292,7 @@ describe("RegisterTable rows", () => {
     expect(cell(row, COL.unit)).toHaveTextContent("°C");
   });
 
-  it("hints that a poll_interval: 0 register is not polled", () => {
+  it("hints that a rate-0 register is not polled", () => {
     renderTable({ rows: watchRows(["setpoints/energy_reset"]), snap: snapshot({}) });
     expect(screen.getByText("not polled")).toBeInTheDocument();
   });
@@ -304,6 +314,26 @@ describe("RegisterTable rows", () => {
       "Write control/relay",
     );
     expect(within(row).queryByLabelText(/New value for/)).not.toBeInTheDocument();
+  });
+
+  it("shows a string register's text as its value, with nothing to write", () => {
+    const model = register({
+      event: "identity",
+      name: "model",
+      address: 40021,
+      datatype: "string",
+      unit: "",
+      writable: false,
+    });
+    renderTable({
+      rows: watchRows(["identity/model"]),
+      registers: [model],
+      snap: snapshot({ "identity/model": { value: "PM-3000", ts_ms: 1_700_000_000_000 } }),
+    });
+    const row = bodyRow();
+    expect(cell(row, COL.type)).toHaveTextContent("string");
+    expect(cell(row, COL.value)).toHaveTextContent("PM-3000");
+    expect(within(cell(row, COL.write)).getByTitle(/read-only/)).toBeInTheDocument();
   });
 
   it("marks a non-writable register with a subdued indicator in the Write column", () => {
@@ -399,7 +429,7 @@ describe("RegisterTable unrepresentable values", () => {
    *  carry — what the extension sends for a NaN or ±Inf off the wire. */
   function nullValueBridge(actions: string[] = []): BridgeTransport {
     return bridgeStub((action) => {
-      actions.push(action.replace(/^modbus\//, ""));
+      actions.push(action.replace(/^Modbus\//, ""));
       return {
         name: "power/total",
         address: 12,
@@ -604,9 +634,9 @@ describe("RegisterTable raw rows", () => {
     });
   }
 
-  /** The actions issued, in order, without the `modbus/` prefix. */
+  /** The actions issued, in order, without the `Modbus/` prefix. */
   function actions(calls: RawCall[]): string[] {
-    return calls.map((c) => c.action.replace(/^modbus\//, ""));
+    return calls.map((c) => c.action.replace(/^Modbus\//, ""));
   }
 
   function select(row: HTMLElement, name: string): HTMLSelectElement {
@@ -621,7 +651,7 @@ describe("RegisterTable raw rows", () => {
     expect(cell(row, COL.register)).toHaveTextContent("—");
     expect(cell(row, COL.unit)).toHaveTextContent("—");
     // …and puts an editor in each of the three it does.
-    expect(within(cell(row, COL.address)).getByLabelText("Raw address")).toHaveValue("0");
+    expect(within(cell(row, COL.address)).getByLabelText("Raw address")).toHaveValue("1");
     expect(select(row, "Raw table")).toHaveValue("holding");
     expect(select(row, "Raw datatype")).toHaveValue("uint16");
   });
@@ -633,7 +663,7 @@ describe("RegisterTable raw rows", () => {
     expect(storedRaw(view).address).toBe("0x64");
   });
 
-  it("flags an unparseable address and leaves the last good one stored", () => {
+  it("flags an unparsable address and leaves the last good one stored", () => {
     const view = renderTable({ rows: [rawRow({ address: "10" })] });
     const input = screen.getByLabelText("Raw address");
     fireEvent.change(input, { target: { value: "beef" } });
@@ -738,6 +768,46 @@ describe("RegisterTable raw rows", () => {
     await waitFor(() => expect(actions(calls)).toEqual(["write_coil", "read_register"]));
     expect(calls[0]?.params).toMatchObject({ address: 3, value: "ON" });
     expect(cell(bodyRow(), COL.value)).toHaveTextContent("ON");
+  });
+
+  it("offers no write on a device whose extension keeps raw writes off, saying why", () => {
+    renderTable({
+      rows: [rawRow({ table: "holding" }), rawRow({ table: "coil", datatype: "bool" })],
+      device: deviceEntry({ raw_writes: false }),
+    });
+    for (const index of [0, 1]) {
+      const write = cell(bodyRow(index), COL.write);
+      expect(within(write).getByTitle(/Allow Raw Writes/)).toBeInTheDocument();
+      expect(within(write).queryByRole("button", { name: "Write" })).not.toBeInTheDocument();
+      expect(within(write).queryByRole("switch")).not.toBeInTheDocument();
+    }
+    expect(screen.getAllByRole("button", { name: /^read /i })).toHaveLength(2);
+  });
+
+  it("refuses an address outside the device's base before calling the extension", async () => {
+    const calls: RawCall[] = [];
+    renderTable({ rows: [rawRow({ address: "0" })], bridge: rawBridge(calls) });
+    fireEvent.click(screen.getByRole("button", { name: /^read /i }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(calls).toEqual([]);
+  });
+
+  it("sends a typed hex address as the wire address in the device's numbering", async () => {
+    for (const [base, expected] of [
+      [0, 100],
+      [1, 101],
+    ] as const) {
+      const calls: RawCall[] = [];
+      renderTable({
+        rows: [rawRow({ address: "0x64" })],
+        bridge: rawBridge(calls),
+        device: deviceEntry({ address_base: base }),
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^read /i }));
+      await waitFor(() => expect(calls).toHaveLength(1));
+      expect(calls[0]?.params).toMatchObject({ address: expected });
+      cleanup();
+    }
   });
 
   it("marks the tables Modbus can't write, whatever the datatype", () => {
@@ -862,7 +932,7 @@ describe("RegisterTable without a catalog", () => {
   it("sends an unvalidated write and lets the extension have the last word", async () => {
     const sent: unknown[] = [];
     const bridge = bridgeStub((action, params) => {
-      sent.push({ action: action.replace(/^modbus\//, ""), value: params.value });
+      sent.push({ action: action.replace(/^Modbus\//, ""), value: params.value });
       return { name: "power/total", value: params.value, success: true };
     });
     renderUnjoined(bridge);
@@ -892,7 +962,7 @@ describe("RegisterTable row locking", () => {
       release = r;
     });
     const bridge = bridgeStub((action, params) => {
-      calls.push(action.replace(/^modbus\//, ""));
+      calls.push(action.replace(/^Modbus\//, ""));
       return gate.then(() => ({ name: "power/total", value: params.value ?? 1, success: true }));
     });
     return { bridge, resolve: () => release(), calls };
