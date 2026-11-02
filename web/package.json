@@ -1,7 +1,7 @@
 {
   "name": "zelos-app-modbus",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "A tab to read and write Modbus registers: mapped ones by name with live values, or raw addresses in the holding, input, coil and discrete tables (raw writes need the extension's Allow Raw Writes setting). Writes are range-checked. Needs the Modbus agent extension.",
   "author": "Zelos",
